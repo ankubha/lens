@@ -1,0 +1,30 @@
+# Virtual environment
+venv/
+
+# Environment variables (never commit secrets)
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node (for frontend later)
+node_modules/
+.next/
+
+# Database
+*.db
+*.sqlite
+
+# Logs
+*.log
