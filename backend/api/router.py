@@ -79,9 +79,11 @@ async def profile_file(file: UploadFile = File(...)):
 
         if modality == "structured":
             contract = profile_structured(temp_path)
+            contract.filename = file.filename
 
         elif modality == "unstructured":
             contract = profile_unstructured(temp_path)
+            contract.filename = file.filename
 
         elif modality == "semi_structured":
             raise HTTPException(

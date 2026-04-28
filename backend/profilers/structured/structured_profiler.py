@@ -4,8 +4,8 @@ Lens — Structured Profiler
 Takes a CSV or XLSX file, returns a fully populated ProfileContract.
 Deterministic. No LLM on the hot path. SR 11-7 compliant.
 """
-
 from __future__ import annotations
+import os
 import uuid
 import math
 from datetime import datetime
@@ -13,6 +13,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import re
+import json as _json
+from groq import Groq
+from dotenv import load_dotenv
+load_dotenv()
 
 from backend.models.profile_contract import (
     ProfileContract,
@@ -145,7 +150,66 @@ def compute_health_score(df: pd.DataFrame, columns: list[ColumnProfile]) -> tupl
 # ─────────────────────────────────────────────
 # COLUMN PROFILER
 # ─────────────────────────────────────────────
+def generate_column_definitions(columns: list) -> dict[str, str]:
+    """
+    One LLM call generates plain English business definitions
+    for all columns. Works for any CSV — no hardcoding.
+    Returns dict of column_name -> definition.
+    """
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
+        col_context = []
+        for col in columns:
+            sample = []
+            if col.top_values:
+                sample = [tv["value"] for tv in col.top_values[:3]]
+            elif col.min is not None:
+                sample = [f"min={col.min}", f"max={col.max}"]
+            elif col.min_date:
+                sample = [str(col.min_date)[:10]]
+
+            col_context.append({
+                "name":          col.column_name,
+                "data_type":     col.data_type,
+                "semantic_type": col.semantic_type or "unknown",
+                "sample_values": sample,
+                "is_pii":        col.is_pii,
+            })
+
+        prompt = f"""You are a data steward writing a business data dictionary.
+
+For each column below write a short generic business definition (1 sentence, plain English).
+Explain what this field represents in a business context.
+Do NOT repeat the column name in the definition.
+
+Columns:
+{_json.dumps(col_context, indent=2)}
+
+Respond ONLY with a JSON object. No markdown, no backticks:
+{{
+  "loan_id": "A unique identifier assigned to each loan record.",
+  "borrower_name": "The full legal name of the individual or entity receiving the loan."
+}}"""
+
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=2048,
+        )
+
+        text = response.choices[0].message.content.strip()
+        text = re.sub(r"^```json\s*", "", text)
+        text = re.sub(r"^```\s*",      "", text)
+        text = re.sub(r"\s*```$",      "", text)
+
+        return _json.loads(text.strip())
+
+    except Exception as e:
+        print(f"  [Lens] Column definitions failed: {e}")
+        return {}
+    
 def profile_column(series: pd.Series) -> ColumnProfile:
     col_name = series.name
     is_pii = detect_pii(col_name)
@@ -209,6 +273,53 @@ def profile_column(series: pd.Series) -> ColumnProfile:
             # Gap detection — check if any expected dates are missing
             date_range = pd.date_range(clean.min(), clean.max(), freq="D")
             base.has_gaps = len(date_range) > unique
+    
+    # ── Histogram (numeric columns only) ─────
+    if pd.api.types.is_numeric_dtype(series):
+        clean = series.dropna()
+        if len(clean) > 0:
+            counts, bin_edges = np.histogram(clean, bins=min(20, len(clean.unique())))
+            base.histogram = [
+                {
+                    "bin_start": round(float(bin_edges[i]), 4),
+                    "bin_end":   round(float(bin_edges[i+1]), 4),
+                    "count":     int(counts[i]),
+                }
+                for i in range(len(counts))
+            ]
+            # Extreme values
+            sorted_vals = clean.sort_values()
+            base.extreme_min = [
+                {"value": round(float(v), 4), "count": int((clean == v).sum())}
+                for v in sorted_vals.head(10).unique()
+            ]
+            base.extreme_max = [
+                {"value": round(float(v), 4), "count": int((clean == v).sum())}
+                for v in sorted_vals.tail(10).unique()[::-1]
+            ]
+
+    elif pd.api.types.is_object_dtype(series):
+        clean = series.dropna()
+        if len(clean) > 0:
+            vc = clean.value_counts()
+            # Use top values as histogram bars
+            base.histogram = [
+                {
+                    "bin_start": 0,
+                    "bin_end":   0,
+                    "count":     int(v),
+                    "label":     str(k)[:20],
+                }
+                for k, v in vc.head(20).items()
+            ]
+            base.extreme_min = [
+                {"value": str(k), "count": int(v)}
+                for k, v in vc.tail(10).items()
+            ]
+            base.extreme_max = [
+                {"value": str(k), "count": int(v)}
+                for k, v in vc.head(10).items()
+            ]
 
     return base
 
@@ -291,6 +402,12 @@ def profile_structured(
     # ── Profile each column ──────────────────
     columns = [profile_column(df[col]) for col in df.columns]
 
+    # ── Generate business definitions (one LLM call for all columns) ──
+    print("  [Lens] Generating column definitions via LLM...")
+    definitions = generate_column_definitions(columns)
+    for col in columns:
+        col.business_definition = definitions.get(col.column_name)
+
     # ── Health score ─────────────────────────
     health, breakdown = compute_health_score(df, columns)
 
@@ -308,6 +425,21 @@ def profile_structured(
         "detail": f"Profiled {path.name} — {len(df)} rows × {len(df.columns)} columns",
     }]
 
+    # ── Sample rows ──────────────────────────
+    def rows_to_dict(df_slice: pd.DataFrame) -> list[dict]:
+        return [
+            {k: (str(v) if not isinstance(v, (int, float, bool, type(None))) else v)
+             for k, v in row.items()}
+            for row in df_slice.to_dict('records')
+        ]
+
+    sample_head = rows_to_dict(df.head(10))
+    sample_tail = rows_to_dict(df.tail(10))
+
+    # ── Duplicate rows ────────────────────────
+    dup_mask = df.duplicated(keep=False)
+    duplicate_rows = rows_to_dict(df[dup_mask].head(20)) if dup_mask.any() else []
+
     # ── Build the contract ───────────────────
     contract = ProfileContract(
         profile_id=str(uuid.uuid4()),
@@ -319,6 +451,9 @@ def profile_structured(
         row_count=len(df),
         column_count=len(df.columns),
         duplicate_row_count=int(df.duplicated().sum()),
+        duplicate_rows=duplicate_rows,
+        sample_head=sample_head,
+        sample_tail=sample_tail,
         columns=columns,
         health_score=health,
         health_breakdown=breakdown,

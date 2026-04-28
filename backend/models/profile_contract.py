@@ -98,6 +98,10 @@ class ColumnProfile(BaseModel):
     unique_pct: float = 0.0
     is_pii: bool = False
     sensitivity: SensitivityTier = SensitivityTier.INTERNAL
+    business_definition: str | None = None
+    histogram: list[dict] | None = None      # [{bin_start, bin_end, count}]
+    extreme_min: list[dict] | None = None    # [{value, count}] bottom 10
+    extreme_max: list[dict] | None = None    # [{value, count}] top 10
 
     # Numeric stats (None for non-numeric columns)
     min: float | None = None
@@ -186,6 +190,9 @@ class ProfileContract(BaseModel):
     row_count: int | None = None
     column_count: int | None = None
     duplicate_row_count: int | None = None
+    duplicate_rows: list[dict] = []          # actual duplicate rows
+    sample_head: list[dict] = []             # first 10 rows
+    sample_tail: list[dict] = []             # last 10 rows
     columns: list[ColumnProfile] = []
 
     # ── Document-level (unstructured) ─────────

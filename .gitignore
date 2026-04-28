@@ -28,3 +28,7 @@ node_modules/
 
 # Logs
 *.log
+
+# Next.js
+frontend/.next/
+frontend/node_modules/
