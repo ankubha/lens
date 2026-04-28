@@ -14,6 +14,9 @@ import uuid
 from backend.models.profile_contract import ProfileContract, DataModality
 from backend.profilers.structured.structured_profiler import profile_structured
 from backend.profilers.unstructured.unstructured_profiler import profile_unstructured
+from backend.profilers.semi_structured.semi_structured_profiler import profile_semi_structured
+from backend.agent.lensbot import ask_lensbot
+from pydantic import BaseModel as PydanticBase
 
 router = APIRouter(prefix="/api", tags=["profiling"])
 
@@ -86,10 +89,8 @@ async def profile_file(file: UploadFile = File(...)):
             contract.filename = file.filename
 
         elif modality == "semi_structured":
-            raise HTTPException(
-                status_code=501,
-                detail="Semi-structured profiler coming soon."
-            )
+            contract = profile_semi_structured(temp_path)
+            contract.filename = file.filename
 
         else:
             raise HTTPException(status_code=400, detail="Unknown file type.")
@@ -150,39 +151,53 @@ def get_profile(profile_id: str):
 def get_page_summaries(profile_id: str):
     """
     Generate page-by-page summaries on demand.
-    Only called when user clicks 'View Page Summaries' in the UI.
-    Not generated during initial profile to keep response fast.
+    Lazy loaded — only called when user requests them.
     """
     if profile_id not in profile_store:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Profile '{profile_id}' not found."
-        )
+        raise HTTPException(status_code=404, detail=f"Profile '{profile_id}' not found.")
 
     contract = profile_store[profile_id]
 
     if contract.modality != DataModality.UNSTRUCTURED:
-        raise HTTPException(
-            status_code=400,
-            detail="Page summaries only available for unstructured documents."
-        )
+        raise HTTPException(status_code=400, detail="Page summaries only available for unstructured documents.")
 
-    # Return cached if already generated
     if contract.summary and contract.summary.page_summaries:
         return {"page_summaries": contract.summary.page_summaries}
 
-    # Generate on demand
+    # Generate on demand using saved file path from audit log
     from backend.profilers.unstructured.unstructured_profiler import (
         generate_page_summaries
     )
     import pdfplumber
+    from pathlib import Path
 
-    # Find the original file — we need to re-read it
-    # For now return a message (full implementation needs file storage)
-    return {
-        "message": "Page summaries will be generated when file storage is implemented.",
-        "profile_id": profile_id,
-    }
+    # Find file in uploads folder
+    uploads = Path("uploads")
+    pdf_files = list(uploads.glob("*.pdf"))
+
+    if not pdf_files:
+        return {
+            "page_summaries": [],
+            "message": "Original file not available for page summary generation. Re-upload to enable.",
+        }
+
+    # Use most recent PDF
+    latest_pdf = max(pdf_files, key=lambda p: p.stat().st_mtime)
+
+    try:
+        with pdfplumber.open(latest_pdf) as pdf:
+            page_texts = [page.extract_text() or "" for page in pdf.pages]
+
+        page_summaries = generate_page_summaries(page_texts, max_pages=min(15, len(page_texts)))
+
+        # Cache in profile
+        if contract.summary:
+            contract.summary.page_summaries = page_summaries
+        
+        return {"page_summaries": page_summaries}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Page summary generation failed: {str(e)}")
 
 
 # ── Health check ──────────────────────────────────────────
@@ -193,3 +208,35 @@ def health():
         "status": "ok",
         "profiles_in_memory": len(profile_store),
     }
+
+# ── LensBot chat ──────────────────────────────────────────
+
+class ChatRequest(PydanticBase):
+    question: str
+    profile_id: str
+    history: list[dict] = []
+
+
+@router.post("/chat")
+def chat(request: ChatRequest):
+    """
+    LensBot — LangGraph agent for answering questions about profiles.
+    Anti-hallucination: only answers from profile data, never invents.
+    """
+    if request.profile_id not in profile_store:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Profile '{request.profile_id}' not found. Please re-upload the file."
+        )
+
+    profile = profile_store[request.profile_id]
+
+    try:
+        result = ask_lensbot(
+            question=request.question,
+            profile=profile,
+            history=request.history,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

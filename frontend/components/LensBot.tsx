@@ -6,162 +6,93 @@ interface Message {
   role: 'user' | 'bot'
   text: string
   loading?: boolean
+  tool_results?: any[]
 }
 
 interface Props {
   profile?: ProfileContract | null
 }
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
+
 export default function LensBot({ profile }: Props) {
   const [open, setOpen] = useState(false)
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: 'bot',
-      text: profile
-        ? `Hi! I'm LensBot. I can answer questions about **${profile.filename}**. What would you like to know?`
-        : `Hi! I'm LensBot. Upload a file and I'll help you understand your data.`,
-    }
-  ])
+  const [messages, setMessages] = useState<Message[]>([{
+    role: 'bot',
+    text: profile
+      ? `Hi! I'm LensBot 🤖\n\nI can answer questions about **${profile.filename}**.\n\nI only answer from the actual profile data — I never guess or hallucinate. If something isn't in the profile, I'll tell you.\n\nWhat would you like to know?`
+      : `Hi! I'm LensBot 🤖\n\nUpload a file and I'll help you understand your data.`,
+  }])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [showTools, setShowTools] = useState<number | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  // Reset greeting when profile changes
   useEffect(() => {
     if (profile) {
       setMessages([{
         role: 'bot',
-        text: `Hi! I'm LensBot. I can answer questions about **${profile.filename}**. Try asking: "What is the health score?" or "Which columns have missing data?"`,
+        text: `Hi! I'm LensBot 🤖\n\nI can answer questions about **${profile.filename}**.\n\nI only answer from the actual profile data — I never guess or hallucinate.\n\nWhat would you like to know?`,
       }])
     }
   }, [profile?.profile_id])
 
-  const buildContext = () => {
-    if (!profile) return 'No document loaded yet.'
-
-    if (profile.modality === 'structured') {
-      const colSummary = profile.columns.map(c =>
-        `${c.column_name} (${c.data_type}, ${c.missing_pct}% missing, semantic: ${c.semantic_type || 'unknown'}${c.is_pii ? ', PII' : ''})`
-      ).join('\n')
-
-      return `
-DOCUMENT: ${profile.filename}
-MODALITY: Structured dataset (CSV/XLSX)
-ROWS: ${profile.row_count}
-COLUMNS: ${profile.column_count}
-DUPLICATES: ${profile.duplicate_row_count}
-HEALTH SCORE: ${profile.health_score}/100
-HEALTH BREAKDOWN: ${JSON.stringify(profile.health_breakdown)}
-
-COLUMNS:
-${colSummary}
-
-DRIFT ALERTS: ${profile.drift_alerts?.length || 0} detected
-${profile.drift_alerts?.map(d => `- ${d.column_name}: ${d.metric} changed from ${d.prior_value} to ${d.current_value}`).join('\n') || ''}
-      `.trim()
-    }
-
-    if (profile.modality === 'unstructured') {
-      const cbes = profile.critical_business_elements
-        ?.map(f => `${f.field_name}: ${f.value || 'NOT FOUND'}`)
-        .join('\n') || ''
-
-      const findings = profile.additional_findings
-        ?.map(f => `${f.field_name}: ${f.value}`)
-        .join('\n') || ''
-
-      return `
-DOCUMENT: ${profile.filename}
-MODALITY: Unstructured PDF
-DOCUMENT TYPE: ${profile.document_type}
-PAGES: ${profile.page_count}
-HEALTH SCORE: ${profile.health_score}/100
-COMPLETENESS: ${profile.completeness_score}%
-
-CRITICAL BUSINESS ELEMENTS:
-${cbes}
-
-ADDITIONAL FINDINGS:
-${findings}
-
-EXECUTIVE SUMMARY:
-${profile.summary?.executive?.substring(0, 1000) || 'Not available'}
-
-OBLIGATIONS: ${profile.obligations?.length || 0} found
-PARTIES: ${profile.parties?.map(p => `${p.field_name}: ${p.value}`).join(', ') || 'None'}
-      `.trim()
-    }
-
-    return `Document: ${profile.filename}, Modality: ${profile.modality}`
-  }
+  const getHistory = () => messages
+    .filter(m => !m.loading && m.text)
+    .slice(-6)
+    .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text }))
 
   const sendMessage = async () => {
-    if (!input.trim() || loading) return
+    if (!input.trim() || loading || !profile) return
     const question = input.trim()
     setInput('')
 
-    setMessages(prev => [...prev, { role: 'user', text: question }])
+    const newMessages = [...messages, { role: 'user' as const, text: question }]
+    setMessages([...newMessages, { role: 'bot' as const, text: '', loading: true }])
     setLoading(true)
-    setMessages(prev => [...prev, { role: 'bot', text: '', loading: true }])
 
     try {
-      const context = buildContext()
-
-      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      const res = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.NEXT_PUBLIC_GROQ_API_KEY}`,
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'meta-llama/llama-4-scout-17b-16e-instruct',
-          messages: [
-            {
-              role: 'system',
-              content: `You are LensBot, an intelligent data assistant for Wells Fargo CDO.
-You answer questions about documents and datasets that have been profiled by the Lens platform.
-
-CRITICAL RULES:
-1. Only answer based on the provided profile data below
-2. If the answer is not in the profile data, say exactly: "This information is not available in the current profile."
-3. Never hallucinate or invent data
-4. Be concise and professional
-5. Use banking/financial language appropriate for a CDO audience
-6. When citing values, mention the source (page number, column name, etc.)
-
-PROFILE DATA:
-${context}`,
-            },
-            {
-              role: 'user',
-              content: question,
-            }
-          ],
-          temperature: 0.1,
-          max_tokens: 1024,
+          question,
+          profile_id: profile.profile_id,
+          history: getHistory(),
         }),
       })
 
-      const data = await response.json()
-      const answer = data.choices?.[0]?.message?.content || 'Sorry, I could not generate a response.'
+      const data = await res.json()
 
-      setMessages(prev => [
-        ...prev.filter(m => !m.loading),
-        { role: 'bot', text: answer },
+      if (!res.ok) throw new Error(data.detail || 'Request failed')
+
+      setMessages([
+        ...newMessages,
+        {
+          role: 'bot',
+          text: data.answer,
+          tool_results: data.tool_results,
+        },
       ])
-    } catch (e) {
-      setMessages(prev => [
-        ...prev.filter(m => !m.loading),
-        { role: 'bot', text: 'Sorry, I encountered an error. Please try again.' },
+    } catch (e: any) {
+      setMessages([
+        ...newMessages,
+        { role: 'bot', text: `Sorry, I encountered an error: ${e.message}` },
       ])
     } finally {
       setLoading(false)
     }
   }
+
+  const suggestions = profile?.modality === 'structured'
+    ? ['What is the health score?', 'Which columns have PII?', 'Any missing data?', 'Suggest a primary key']
+    : profile?.modality === 'unstructured'
+    ? ['Who are the parties?', 'What is the loan amount?', 'When does it mature?', 'Any covenants?']
+    : ['What fields were detected?', 'What is the schema?']
 
   return (
     <>
@@ -197,7 +128,7 @@ ${context}`,
         )}
       </button>
 
-      {/* LensBot label */}
+      {/* Label */}
       {!open && (
         <div style={{
           position: 'fixed',
@@ -223,8 +154,8 @@ ${context}`,
           position: 'fixed',
           bottom: 100,
           right: 28,
-          width: 380,
-          height: 520,
+          width: 400,
+          height: 560,
           background: 'var(--surface)',
           border: '0.5px solid var(--border-1)',
           borderRadius: 'var(--radius-xl)',
@@ -243,10 +174,7 @@ ${context}`,
             .msg-dot { animation: blink 1.2s ease-in-out infinite; }
             .msg-dot:nth-child(2) { animation-delay: 0.2s; }
             .msg-dot:nth-child(3) { animation-delay: 0.4s; }
-            @keyframes blink {
-              0%, 100% { opacity: 0.3; }
-              50%       { opacity: 1; }
-            }
+            @keyframes blink { 0%,100%{opacity:0.3;} 50%{opacity:1;} }
           `}</style>
 
           {/* Header */}
@@ -259,46 +187,24 @@ ${context}`,
             gap: 10,
           }}>
             <div style={{
-              width: 34,
-              height: 34,
+              width: 34, height: 34,
               borderRadius: '50%',
               background: 'rgba(255,255,255,0.15)',
               border: '1.5px solid rgba(255,205,65,0.6)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              flexShrink: 0,
-            }}>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                <path d="M12 2C6.48 2 2 6.02 2 11c0 2.53 1.06 4.83 2.78 6.5L4 22l4.72-1.56C9.74 20.79 10.85 21 12 21c5.52 0 10-4.02 10-9S17.52 2 12 2z" fill="white"/>
-              </svg>
-            </div>
-            <div>
-              <div style={{
-                fontSize: 14,
-                fontWeight: 600,
-                color: 'white',
-                fontFamily: 'var(--font-display)',
-              }}>
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 18,
+            }}>🤖</div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 14, fontWeight: 600, color: 'white', fontFamily: 'var(--font-display)' }}>
                 LensBot
               </div>
-              <div style={{
-                fontSize: 10,
-                color: 'rgba(255,255,255,0.7)',
-                letterSpacing: '0.04em',
-              }}>
-                Wells Fargo CDO Intelligence
+              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.7)', letterSpacing: '0.04em' }}>
+                {profile ? `Analysing: ${profile.filename.substring(0, 28)}${profile.filename.length > 28 ? '…' : ''}` : 'Wells Fargo CDO Intelligence'}
               </div>
             </div>
-            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5 }}>
-              <div style={{
-                width: 6,
-                height: 6,
-                borderRadius: '50%',
-                background: '#4ade80',
-                boxShadow: '0 0 0 2px rgba(74,222,128,0.3)',
-              }}/>
-              <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.6)' }}>Online</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+              <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#4ade80', boxShadow: '0 0 0 2px rgba(74,222,128,0.3)' }}/>
+              <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.6)' }}>LangGraph</span>
             </div>
           </div>
 
@@ -313,42 +219,83 @@ ${context}`,
             background: 'var(--surface-2)',
           }}>
             {messages.map((msg, i) => (
-              <div key={i} style={{
-                display: 'flex',
-                justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start',
-              }}>
+              <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 4 }}>
                 <div style={{
-                  maxWidth: '80%',
+                  maxWidth: '85%',
                   padding: '10px 14px',
-                  borderRadius: msg.role === 'user'
-                    ? '16px 16px 4px 16px'
-                    : '16px 16px 16px 4px',
-                  background: msg.role === 'user'
-                    ? 'var(--wf-red)'
-                    : 'var(--surface)',
+                  borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+                  background: msg.role === 'user' ? 'var(--wf-red)' : 'var(--surface)',
                   color: msg.role === 'user' ? 'white' : 'var(--ink)',
                   fontSize: 13,
                   lineHeight: 1.6,
-                  border: msg.role === 'bot'
-                    ? '0.5px solid var(--border-1)'
-                    : 'none',
+                  border: msg.role === 'bot' ? '0.5px solid var(--border-1)' : 'none',
                   boxShadow: 'var(--shadow-sm)',
                 }}>
                   {msg.loading ? (
                     <div style={{ display: 'flex', gap: 4, padding: '2px 0' }}>
                       {[0,1,2].map(j => (
-                        <div key={j} className="msg-dot" style={{
-                          width: 6,
-                          height: 6,
-                          borderRadius: '50%',
-                          background: 'var(--ink-3)',
-                        }}/>
+                        <div key={j} className="msg-dot" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ink-3)' }}/>
                       ))}
                     </div>
                   ) : (
-                    <span style={{ whiteSpace: 'pre-wrap' }}>{msg.text}</span>
+                    <span style={{ whiteSpace: 'pre-wrap' }}>
+                      {msg.text.split(/(\*\*[^*]+\*\*)/g).map((part, j) =>
+                        part.startsWith('**') && part.endsWith('**') ? (
+                          <strong key={j} style={{ fontWeight: 600, color: 'inherit' }}>
+                            {part.slice(2, -2)}
+                          </strong>
+                        ) : (
+                          <span key={j}>{part}</span>
+                        )
+                      )}
+                    </span>
                   )}
                 </div>
+
+                {/* Tool results toggle */}
+                {msg.tool_results && msg.tool_results.length > 0 && (
+                  <button
+                    onClick={() => setShowTools(showTools === i ? null : i)}
+                    style={{
+                      fontSize: 10,
+                      color: 'var(--ink-3)',
+                      background: 'none',
+                      border: '0.5px solid var(--border-1)',
+                      borderRadius: 8,
+                      padding: '2px 8px',
+                      cursor: 'pointer',
+                      fontFamily: 'var(--font-body)',
+                    }}
+                  >
+                    {showTools === i ? '▲ hide sources' : `▼ view sources (${msg.tool_results.length} tool${msg.tool_results.length > 1 ? 's' : ''})`}
+                  </button>
+                )}
+
+                {/* Tool results expanded */}
+                {showTools === i && msg.tool_results && (
+                  <div style={{
+                    maxWidth: '85%',
+                    background: 'var(--surface-3)',
+                    border: '0.5px solid var(--border-1)',
+                    borderRadius: 8,
+                    padding: '8px 12px',
+                    fontSize: 11,
+                    color: 'var(--ink-3)',
+                    fontFamily: 'monospace',
+                    maxHeight: 160,
+                    overflowY: 'auto',
+                    lineHeight: 1.5,
+                  }}>
+                    {msg.tool_results.map((tr, j) => (
+                      <div key={j}>
+                        <span style={{ color: 'var(--wf-red)', fontWeight: 600 }}>
+                          [{tr.tool}]
+                        </span>{' '}
+                        {JSON.stringify(tr.result, null, 0).substring(0, 200)}...
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
             <div ref={bottomRef}/>
@@ -364,13 +311,10 @@ ${context}`,
               gap: 6,
               flexWrap: 'wrap',
             }}>
-              {(profile.modality === 'structured'
-                ? ['What is the health score?', 'Which columns have PII?', 'Any missing data?']
-                : ['Who are the parties?', 'What is the loan amount?', 'What is the maturity date?']
-              ).map(q => (
+              {suggestions.map(q => (
                 <button
                   key={q}
-                  onClick={() => { setInput(q); }}
+                  onClick={() => setInput(q)}
                   style={{
                     fontSize: 11,
                     padding: '4px 10px',
@@ -400,14 +344,15 @@ ${context}`,
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && sendMessage()}
-              placeholder="Ask about your data..."
+              placeholder={profile ? 'Ask about your data...' : 'Upload a file first...'}
+              disabled={!profile || loading}
               style={{
                 flex: 1,
                 padding: '9px 14px',
                 borderRadius: 20,
                 border: '0.5px solid var(--border-2)',
                 fontSize: 13,
-                background: 'var(--surface-2)',
+                background: profile ? 'var(--surface-2)' : 'var(--surface-3)',
                 color: 'var(--ink)',
                 outline: 'none',
                 fontFamily: 'var(--font-body)',
@@ -415,14 +360,14 @@ ${context}`,
             />
             <button
               onClick={sendMessage}
-              disabled={!input.trim() || loading}
+              disabled={!input.trim() || loading || !profile}
               style={{
                 width: 38,
                 height: 38,
                 borderRadius: '50%',
-                background: input.trim() ? 'var(--wf-red)' : 'var(--surface-3)',
+                background: input.trim() && profile ? 'var(--wf-red)' : 'var(--surface-3)',
                 border: 'none',
-                cursor: input.trim() ? 'pointer' : 'default',
+                cursor: input.trim() && profile ? 'pointer' : 'default',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',

@@ -22,6 +22,10 @@ from datetime import datetime
 from pathlib import Path
 
 import pdfplumber
+import fitz  # PyMuPDF
+import numpy as np
+from PIL import Image
+import io
 from groq import Groq
 from dotenv import load_dotenv
 
@@ -714,6 +718,46 @@ def compute_document_health(cbes: list[ExtractedFact]) -> tuple[float, dict]:
 # MAIN PROFILER
 # ─────────────────────────────────────────────
 
+def extract_text_with_ocr(pdf_path: Path) -> list[str]:
+    """
+    Extract text from scanned PDF using EasyOCR.
+    Falls back gracefully if OCR fails.
+    Each page returns its extracted text.
+    """
+    try:
+        import easyocr
+        print("  [Lens] Scanned PDF detected — initialising EasyOCR...")
+        reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+
+        doc = fitz.open(str(pdf_path))
+        page_texts = []
+
+        for page_num in range(len(doc)):
+            print(f"  [Lens] OCR page {page_num + 1}/{len(doc)}...")
+            page = doc[page_num]
+
+            # Render page to image at 200 DPI
+            mat = fitz.Matrix(200/72, 200/72)
+            pix = page.get_pixmap(matrix=mat)
+            img_bytes = pix.tobytes("png")
+
+            # Convert to numpy array for EasyOCR
+            img = Image.open(io.BytesIO(img_bytes))
+            img_array = np.array(img)
+
+            # Run OCR
+            results = reader.readtext(img_array)
+            page_text = " ".join([r[1] for r in results])
+            page_texts.append(page_text)
+
+        doc.close()
+        print(f"  [Lens] OCR complete — {len(page_texts)} pages processed")
+        return page_texts
+
+    except Exception as e:
+        print(f"  [Lens] OCR failed: {e}")
+        return []
+
 def profile_unstructured(
     file_path: str | Path,
     include_page_summaries: bool = False,
@@ -733,6 +777,19 @@ def profile_unstructured(
         print("  [Lens] Extracting text from all pages...")
         page_texts = [page.extract_text() or "" for page in pdf.pages]
         full_text = "\n".join(page_texts)
+
+        # ── OCR fallback for scanned PDFs ─────
+        total_text_length = sum(len(t) for t in page_texts)
+        if total_text_length < 500:
+            print("  [Lens] Minimal text detected — trying OCR...")
+            ocr_texts = extract_text_with_ocr(path)
+            if ocr_texts and sum(len(t) for t in ocr_texts) > total_text_length:
+                print("  [Lens] OCR produced better results — using OCR text")
+                page_texts = ocr_texts
+                full_text = "\n".join(page_texts)
+                fingerprint["is_scanned"] = True
+            else:
+                print("  [Lens] OCR did not improve extraction — using original")
 
         print(f"  [Lens] Document: {len(full_text):,} chars — "
               f"sending up to {MAX_CHARS:,} chars per LLM call")

@@ -370,6 +370,71 @@ def detect_drift(
 # MAIN PROFILER FUNCTION
 # ─────────────────────────────────────────────
 
+def generate_cross_column_intelligence(
+    df: pd.DataFrame,
+    columns: list,
+) -> str:
+    """
+    One LLM call. Looks at the entire dataset profile and generates:
+    - Suggested primary key
+    - Functional dependencies
+    - Data quality narrative
+    - Join recommendations
+    - Anomaly observations
+    """
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+        col_summary = []
+        for col in columns:
+            summary = {
+                "name": col.column_name,
+                "type": col.data_type,
+                "semantic": col.semantic_type,
+                "missing_pct": col.missing_pct,
+                "unique_pct": col.unique_pct,
+                "is_pii": col.is_pii,
+            }
+            if col.mean is not None:
+                summary["mean"] = round(col.mean, 2)
+                summary["min"] = col.min
+                summary["max"] = col.max
+                summary["skewness"] = col.skewness
+            if col.top_values:
+                summary["top_values"] = [tv["value"] for tv in col.top_values[:3]]
+            col_summary.append(summary)
+
+        prompt = f"""You are a senior data engineer reviewing a dataset for Wells Fargo CDO.
+
+Dataset: {len(df)} rows × {len(df.columns)} columns
+
+Column profiles:
+{_json.dumps(col_summary, indent=2)}
+
+Write a professional cross-column intelligence report covering:
+
+1. **Suggested Primary Key** — which column(s) uniquely identify each row and why
+2. **Functional Dependencies** — which columns appear to determine other columns (e.g. zip → state, customer_id → name)
+3. **Data Quality Narrative** — a plain English summary of data quality observations, patterns, and concerns
+4. **Join Recommendations** — which columns look like foreign keys suitable for joining with other tables
+5. **Notable Patterns** — any unusual distributions, skewness, constant values, or anomalies worth flagging
+
+Be specific and cite actual column names. Write for a CDO audience — technical but business-aware.
+Keep each section concise (2-3 sentences max).
+Format with the bold headers above."""
+
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=1024,
+        )
+        return response.choices[0].message.content.strip()
+
+    except Exception as e:
+        print(f"  [Lens] Cross-column intelligence failed: {e}")
+        return ""
+
 def profile_structured(
     file_path: str | Path,
     prior_profile: ProfileContract | None = None,
@@ -440,6 +505,10 @@ def profile_structured(
     dup_mask = df.duplicated(keep=False)
     duplicate_rows = rows_to_dict(df[dup_mask].head(20)) if dup_mask.any() else []
 
+    # ── Cross-column intelligence ─────────────
+    print("  [Lens] Generating cross-column intelligence...")
+    cross_column_intelligence = generate_cross_column_intelligence(df, columns)
+
     # ── Build the contract ───────────────────
     contract = ProfileContract(
         profile_id=str(uuid.uuid4()),
@@ -461,6 +530,7 @@ def profile_structured(
         prior_profile_id=prior_id,
         audit_log=audit_log,
         deterministic_only=True,
+        raw_llm_narrative=cross_column_intelligence,
     )
 
     return contract

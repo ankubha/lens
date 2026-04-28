@@ -1,0 +1,7 @@
+[
+  {"loan_id": "L001", "borrower": {"name": "John Smith", "email": "john@example.com"}, "amount": 500000, "rate": 8.5, "status": "active", "dates": {"originated": "2022-03-15", "maturity": "2027-03-15"}},
+  {"loan_id": "L002", "borrower": {"name": "Jane Doe", "email": "jane@example.com"}, "amount": 1200000, "rate": 7.2, "status": "active", "dates": {"originated": "2021-06-01", "maturity": "2031-06-01"}},
+  {"loan_id": "L003", "borrower": {"name": "Acme Corp", "email": "info@acme.com"}, "amount": 3500000, "rate": 9.1, "status": "active", "dates": {"originated": "2023-01-10", "maturity": "2026-01-10"}},
+  {"loan_id": "L004", "borrower": {"name": "Bob Johnson", "email": "bob@example.com"}, "amount": 250000, "rate": 8.8, "status": "closed", "dates": {"originated": "2020-09-20", "maturity": "2025-09-20"}},
+  {"loan_id": "L005", "borrower": {"name": "TechStart Inc", "email": "contact@techstart.com"}, "amount": 750000, "rate": 7.9, "status": "active", "dates": {"originated": "2023-07-01", "maturity": "2028-07-01"}}
+]

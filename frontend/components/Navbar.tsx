@@ -1,6 +1,7 @@
 'use client'
 import { useState } from 'react'
 import Image from 'next/image'
+import Link from 'next/link'
 
 export default function Navbar() {
   const [active, setActive] = useState('profiles')
@@ -23,9 +24,17 @@ export default function Navbar() {
         justifyContent: 'space-between',
       }}>
 
-        {/* LEFT — Wells Fargo logo + Lens wordmark */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
-
+        {/* LEFT — Wells Fargo logo + Lens wordmark — clickable, goes home */}
+        <Link
+          href="/"
+          className="nav-logo"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 16,
+            textDecoration: 'none',
+          }}
+        >
           {/* Wells Fargo horizontal logo */}
           <Image
             src="/wf-logo-horizontal.png"
@@ -58,7 +67,7 @@ export default function Navbar() {
             </span>
             <span style={{
               fontSize: 10,
-              color: 'var(--wf-gold)',
+              color: 'rgba(255,255,255,0.85)',
               letterSpacing: '0.07em',
               textTransform: 'uppercase',
               lineHeight: 1,
@@ -66,8 +75,7 @@ export default function Navbar() {
               CDO Intelligence
             </span>
           </div>
-
-        </div>
+        </Link>
 
         {/* CENTER — Nav items */}
         <div style={{ display: 'flex', gap: 4 }}>
@@ -110,19 +118,14 @@ export default function Navbar() {
           alignItems: 'flex-end',
           gap: 3,
         }}>
-
-          {/* POC credit */}
           <span style={{
             fontSize: 11,
             color: 'var(--wf-gold)',
             letterSpacing: '0.03em',
             fontWeight: 500,
-            fontStyle: 'italic',
           }}>
             POC by Anubhav Bhattacharya
           </span>
-
-          {/* API status dot */}
           <div style={{
             display: 'flex',
             alignItems: 'center',
@@ -143,7 +146,6 @@ export default function Navbar() {
               API Connected
             </span>
           </div>
-
         </div>
 
       </div>

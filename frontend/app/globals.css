@@ -106,3 +106,8 @@ body {
 .animate-pulse-slow {
   animation: pulse 1.8s ease-in-out infinite;
 }
+
+.nav-logo:hover {
+  opacity: 0.85;
+  transition: opacity 0.15s ease;
+}

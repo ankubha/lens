@@ -6,6 +6,7 @@ import HealthGauge from '@/components/HealthGauge'
 import Badge from '@/components/Badge'
 import StructuredProfile from '@/components/StructuredProfile'
 import UnstructuredProfile from '@/components/UnstructuredProfile'
+import SemiStructuredProfile from '@/components/SemiStructuredProfile'
 import LensBot from '@/components/LensBot'
 
 export default function ProfilePage() {
@@ -65,10 +66,13 @@ export default function ProfilePage() {
 
   const isStructured = profile.modality === 'structured'
   const isUnstructured = profile.modality === 'unstructured'
+  const isSemiStructured = profile.modality === 'semi_structured'
 
   const tabs = isStructured
-    ? ['overview', 'sample', 'variables', 'missing', 'correlations', 'interactions', 'outliers', 'heatmap', 'dictionary']
-    : ['overview', 'elements', 'summary', 'obligations', 'dictionary']
+      ? ['overview', 'sample', 'variables', 'missing', 'correlations', 'interactions', 'outliers', 'heatmap', 'dictionary']
+      : isSemiStructured
+      ? ['overview', 'sample', 'schema', 'variables', 'missing', 'heatmap', 'dictionary']
+      : ['overview', 'elements', 'summary', 'obligations', 'dictionary']
 
   const tabLabels: Record<string, string> = {
     overview:     'Overview',
@@ -83,6 +87,7 @@ export default function ProfilePage() {
     elements:     'Business Elements',
     summary:      'Summary',
     obligations:  'Obligations',
+    schema:       'Schema Analysis',
   }
 
   return (
@@ -341,6 +346,28 @@ export default function ProfilePage() {
               <div style={{ fontSize: 11, color: 'var(--ink-3)' }}>{stat.sub}</div>
             </div>
           ))}
+
+          {isSemiStructured && [
+            { label: 'Records', value: profile.row_count?.toLocaleString() || '—', sub: 'flattened rows' },
+            { label: 'Fields', value: profile.column_count?.toString() || '—', sub: 'detected paths' },
+            { label: 'Duplicate Records', value: profile.duplicate_row_count?.toString() || '0', sub: 'exact matches', alert: (profile.duplicate_row_count || 0) > 0 },
+            { label: 'Health Score', value: `${profile.health_score?.toFixed(0) || 0}/100`, sub: 'overall quality' },
+            { label: 'Schema Fields', value: profile.critical_business_elements?.length.toString() || '0', sub: 'paths analysed' },
+          ].map((stat: any) => (
+            <div key={stat.label} style={{
+              background: stat.alert ? 'var(--wf-red-light)' : 'var(--surface-2)',
+              border: `0.5px solid ${stat.alert ? 'rgba(215,30,43,0.2)' : 'var(--border-1)'}`,
+              borderRadius: 'var(--radius-md)',
+              padding: '12px 16px',
+              flex: 1,
+              minWidth: 120,
+            }}>
+              <div style={{ fontSize: 11, color: 'var(--ink-3)' }}>{stat.label}</div>
+              <div style={{ fontSize: 24, fontWeight: 600, color: stat.alert ? 'var(--wf-red)' : 'var(--ink)', lineHeight: 1.2, fontFamily: 'var(--font-display)' }}>{stat.value}</div>
+              <div style={{ fontSize: 11, color: 'var(--ink-3)' }}>{stat.sub}</div>
+            </div>
+          ))}
+
         </div>
 
       </div>
@@ -383,17 +410,23 @@ export default function ProfilePage() {
       {/* Tab content */}
       <div className="animate-fade-in">
         {isStructured && (
-          <StructuredProfile
-            profile={profile}
-            activeTab={activeTab}
-          />
-        )}
-        {isUnstructured && (
-          <UnstructuredProfile
-            profile={profile}
-            activeTab={activeTab}
-          />
-        )}
+        <StructuredProfile
+          profile={profile}
+          activeTab={activeTab}
+        />
+      )}
+      {isSemiStructured && (
+        <SemiStructuredProfile
+          profile={profile}
+          activeTab={activeTab}
+        />
+      )}
+      {isUnstructured && (
+        <UnstructuredProfile
+          profile={profile}
+          activeTab={activeTab}
+        />
+      )}
       </div>
         <LensBot profile={profile} />
     </div>

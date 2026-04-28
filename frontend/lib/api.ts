@@ -60,6 +60,7 @@ export interface ColumnProfile {
   unique_pct: number
   is_pii: boolean
   sensitivity: string
+  business_definition?: string
   min?: number
   max?: number
   mean?: number

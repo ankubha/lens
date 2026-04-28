@@ -207,6 +207,102 @@ export default function StructuredProfile({ profile, activeTab }: Props) {
             </div>
           </Card>
         )}
+
+        {/* Cross-column Intelligence */}
+        {profile.raw_llm_narrative && (
+          <div style={{
+            background: 'var(--surface)',
+            border: '0.5px solid var(--border-1)',
+            borderRadius: 'var(--radius-lg)',
+            overflow: 'hidden',
+            boxShadow: 'var(--shadow-md)',
+            position: 'relative',
+          }}>
+            <div style={{
+              position: 'absolute',
+              top: 0, left: 0, right: 0,
+              height: 3,
+              background: 'linear-gradient(90deg, var(--wf-gold) 0%, var(--wf-gold-dark) 100%)',
+            }}/>
+            <div style={{
+              padding: '16px 20px 14px',
+              borderBottom: '0.5px solid var(--border-1)',
+              background: 'var(--surface-2)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+            }}>
+              <span style={{
+                fontSize: 14,
+                fontWeight: 600,
+                color: 'var(--ink)',
+              }}>
+                Cross-column Intelligence
+              </span>
+              <span style={{
+                fontSize: 11,
+                color: 'var(--ink-3)',
+                fontStyle: 'italic',
+              }}>
+                AI-generated analysis · Llama 4 Scout
+              </span>
+            </div>
+            <div style={{ padding: '20px 24px' }}>
+              {profile.raw_llm_narrative
+                .split(/\n+/)
+                .filter(line => line.trim())
+                .map((line, i) => {
+                  const isHeading = line.startsWith('##')
+                  const clean = line
+                    .replace(/^##\s*\*?\*?/, '')
+                    .replace(/\*\*$/,        '')
+                    .replace(/\*\*/g,        '')
+                    .trim()
+                  return isHeading ? (
+                    <div key={i} style={{
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: 'var(--wf-red)',
+                      textTransform: 'uppercase',
+                      letterSpacing: '0.06em',
+                      marginTop: i === 0 ? 0 : 20,
+                      marginBottom: 6,
+                      paddingBottom: 4,
+                      borderBottom: '1px solid var(--wf-gold-light)',
+                    }}>
+                      {clean}
+                    </div>
+                  ) : (
+                    <p key={i} style={{
+                      fontSize: 14,
+                      color: 'var(--ink-2)',
+                      lineHeight: 1.8,
+                      margin: '0 0 6px 0',
+                    }}>
+                      {clean.split(/(`[^`]+`)/g).map((part, j) =>
+                        part.startsWith('`') && part.endsWith('`') ? (
+                          <code key={j} style={{
+                            fontSize: 13,
+                            fontWeight: 600,
+                            color: 'var(--wf-red)',
+                            background: 'var(--wf-red-light)',
+                            padding: '1px 6px',
+                            borderRadius: 4,
+                            fontFamily: 'monospace',
+                          }}>
+                            {part.slice(1, -1)}
+                          </code>
+                        ) : (
+                          <span key={j}>{part}</span>
+                        )
+                      )}
+                    </p>
+                  )
+                })
+              }
+            </div>
+          </div>
+        )}
       </div>
     )
   }
