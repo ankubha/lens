@@ -5,8 +5,7 @@ All profiling endpoints live here.
 Upload any file → get a ProfileContract back.
 """
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from pathlib import Path
 import shutil
 import uuid
@@ -15,6 +14,7 @@ from backend.models.profile_contract import ProfileContract, DataModality
 from backend.profilers.structured.structured_profiler import profile_structured
 from backend.profilers.unstructured.unstructured_profiler import profile_unstructured
 from backend.profilers.semi_structured.semi_structured_profiler import profile_semi_structured
+from backend.core.fry14_validator import validate_against_schedule_h
 from backend.agent.lensbot import ask_lensbot
 from pydantic import BaseModel as PydanticBase
 
@@ -238,5 +238,86 @@ def chat(request: ChatRequest):
             history=request.history,
         )
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ── FR Y-14Q Schedule H Validation ───────────────────────
+
+@router.get("/profiles/{profile_id}/validate-fry14")
+def validate_fry14(profile_id: str):
+    """
+    Validate extracted profile fields against FR Y-14Q Schedule H rules.
+    Covers all 33 fields with fixed allowable values across H.1, H.2, H.3, H.4.
+    """
+    if profile_id not in profile_store:
+        raise HTTPException(status_code=404, detail=f"Profile '{profile_id}' not found.")
+
+    contract = profile_store[profile_id]
+
+    if contract.modality != DataModality.UNSTRUCTURED:
+        raise HTTPException(
+            status_code=400,
+            detail="FR Y-14Q validation only applies to unstructured documents."
+        )
+
+    profile_dict = contract.model_dump()
+    try:
+        results = validate_against_schedule_h(profile_dict)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
+
+    summary = {
+        "total_checked": len(results),
+        "pass":          sum(1 for r in results if r.status == "pass"),
+        "warn":          sum(1 for r in results if r.status == "warn"),
+        "fail":          sum(1 for r in results if r.status == "fail"),
+        "not_found":     sum(1 for r in results if r.status == "not_found"),
+    }
+
+    return {
+        "profile_id": profile_id,
+        "filename":   contract.filename,
+        "summary":    summary,
+        "results": [
+            {
+                "field_name":       r.field_name,
+                "extracted_value":  r.extracted_value,
+                "schedule_field":   r.schedule_field,
+                "field_no":         r.field_no,
+                "schedule":         r.schedule,
+                "status":           r.status,
+                "message":          r.message,
+                "allowable_values": r.allowable_values,
+                "required":         r.required,
+                "confidence":       r.confidence,
+            }
+            for r in results
+        ],
+    }
+
+from backend.core.dataforge import generate_schema_from_prompt, generate_all_tables
+from pydantic import BaseModel as PydanticBase
+
+class SchemaPromptRequest(PydanticBase):
+    prompt: str
+
+class GenerateDataRequest(PydanticBase):
+    tables: list[dict]
+
+@router.post("/dataforge/schema")
+def dataforge_schema(request: SchemaPromptRequest):
+    """Generate schema from plain English description."""
+    try:
+        tables = generate_schema_from_prompt(request.prompt)
+        return {"tables": tables}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/dataforge/generate")
+def dataforge_generate(request: GenerateDataRequest):
+    """Generate synthetic data for all tables with referential integrity."""
+    try:
+        results = generate_all_tables(request.tables)
+        return {"tables": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

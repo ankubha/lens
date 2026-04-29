@@ -830,6 +830,16 @@ def profile_unstructured(
 
         print("  [Lens]   Hunting for additional findings...")
         additional = extract_additional_findings(full_text, found_fields)
+        
+        # ── Deduplicate additional findings ──────
+        # Remove anything from additional_findings that duplicates a CBE field
+        cbe_field_names = {f.field_name.lower() for f in cbes if f.value}
+        cbe_values = {str(f.value).lower().strip() for f in cbes if f.value}
+        additional = [
+            f for f in additional
+            if f.field_name.lower() not in cbe_field_names
+            and str(f.value or "").lower().strip() not in cbe_values
+        ]
 
         health, breakdown = compute_document_health(cbes)
 
