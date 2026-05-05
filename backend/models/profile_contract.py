@@ -91,6 +91,7 @@ class ColumnProfile(BaseModel):
     """One column's full statistical profile. Used by structured profiler."""
     column_name: str
     data_type: str                            # pandas dtype string
+    var_type: str | None = None              # "Numeric", "Text", "Categorical", "DateTime"
     semantic_type: str | None = None         # "account_number", "iso_currency", "zip", etc.
     missing_count: int = 0
     missing_pct: float = 0.0
@@ -103,6 +104,11 @@ class ColumnProfile(BaseModel):
     extreme_min: list[dict] | None = None    # [{value, count}] bottom 10
     extreme_max: list[dict] | None = None    # [{value, count}] top 10
 
+    # All-type stats
+    infinite_count: int | None = None
+    infinite_pct: float | None = None
+    memory_size: int | None = None           # bytes (deep)
+
     # Numeric stats (None for non-numeric columns)
     min: float | None = None
     max: float | None = None
@@ -112,21 +118,63 @@ class ColumnProfile(BaseModel):
     variance: float | None = None
     skewness: float | None = None
     kurtosis: float | None = None
+    percentile_5: float | None = None
     percentile_25: float | None = None
     percentile_75: float | None = None
+    percentile_95: float | None = None
     zeros_count: int | None = None
+    zeros_pct: float | None = None
     negative_count: int | None = None
+    negative_pct: float | None = None
+    mad: float | None = None                 # median absolute deviation
+    cv: float | None = None                  # coefficient of variation (std/mean)
+    sum_val: float | None = None
+    monotonicity: str | None = None          # "Increasing", "Decreasing", "Non-monotonic"
 
     # Categorical stats (None for non-categorical columns)
     top_values: list[dict[str, Any]] | None = None   # [{"value": x, "count": n}]
     mode: Any | None = None
     entropy: float | None = None
 
+    # Text/Categorical length & unicode stats
+    max_length: int | None = None
+    median_length: float | None = None
+    mean_length: float | None = None
+    min_length: int | None = None
+    total_chars: int | None = None
+    distinct_chars: int | None = None
+    distinct_categories: int | None = None
+    distinct_scripts: int | None = None
+    distinct_blocks: int | None = None
+    unique_exact_count: int | None = None    # values appearing exactly once
+    unique_exact_pct: float | None = None
+    word_frequencies: list[dict] | None = None   # [{word, count}] top 50
+    char_frequencies: list[dict] | None = None   # [{char, count}] top 30
+    sample_values: list[str] | None = None       # first 5 raw values
+    length_histogram: list[dict] | None = None   # [{length, count}] for categorical length dist
+
     # Time-series stats (None for non-datetime columns)
     min_date: datetime | None = None
     max_date: datetime | None = None
-    freshness_days: int | None = None        # How stale is the latest record
+    freshness_days: int | None = None
     has_gaps: bool | None = None
+    time_span_str: str | None = None         # "3 Years, 2 Months, 14 Days"
+    has_time_component: bool | None = None   # True if any value has H:M:S != 00:00:00
+    weekday_count: int | None = None
+    weekend_count: int | None = None
+    weekday_pct: float | None = None
+    weekend_pct: float | None = None
+    # Pre-aggregated distributions (used to draw server-side charts)
+    yearly_distribution: list[dict] | None = None   # [{year, count}]
+    monthly_distribution: list[dict] | None = None  # [{month_num, month_name, count}]
+    dow_distribution: list[dict] | None = None      # [{dow, day_name, count}]
+    hour_distribution: list[dict] | None = None     # [{hour, count}]
+
+    # Per-column quality scores (0–100) — feed the heatmap
+    completeness_score: float | None = None  # (non-null / total) * 100
+    uniqueness_score: float | None = None    # (distinct / non-null) * 100
+    validity_score: float | None = None      # 100 if clean type, 70 if mixed
+    consistency_score: float | None = None   # numeric: % within 3σ; cat/text: 100 - % ultra-rare
 
 
 class DocumentSummary(BaseModel):
@@ -190,10 +238,14 @@ class ProfileContract(BaseModel):
     row_count: int | None = None
     column_count: int | None = None
     duplicate_row_count: int | None = None
-    duplicate_rows: list[dict] = []          # actual duplicate rows
+    duplicate_rows: list[dict] = []          # actual duplicate rows (legacy)
+    duplicate_row_groups: list[dict] = []    # grouped duplicates with __count__ column
     sample_head: list[dict] = []             # first 10 rows
     sample_tail: list[dict] = []             # last 10 rows
     columns: list[ColumnProfile] = []
+    correlation_matrix: dict | None = None            # {col: {col: pearson_r}}
+    missing_correlation_matrix: dict | None = None    # {col: {col: pearson_r of missingness indicators}}
+    numeric_sample_data: dict | None = None           # {col: [float|None, ...]} up to 5 000 rows
 
     # ── Document-level (unstructured) ─────────
     page_count: int | None = None
@@ -202,6 +254,7 @@ class ProfileContract(BaseModel):
     has_tables: bool | None = None
     has_signatures: bool | None = None
     sections_detected: list[str] = []
+    page_texts: list[str] = []   # Truncated page texts (≤ 4 000 chars each) for on-demand LLM summarisation
 
     # ── Health score (all modalities) ─────────
     health_score: float | None = Field(None, ge=0.0, le=100.0)

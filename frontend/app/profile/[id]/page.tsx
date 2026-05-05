@@ -63,7 +63,7 @@ export default function ProfilePage() {
 
   // ── Tabs per modality ────────────────────────────────
   const tabs = isStructured
-    ? ['overview', 'sample', 'variables', 'missing', 'correlations', 'interactions', 'outliers', 'heatmap', 'dictionary']
+    ? ['overview', 'sample', 'variables', 'missing', 'correlations', 'interactions', 'dictionary', 'duplicates', 'intelligence']
     : isSemiStructured
     ? ['overview', 'sample', 'schema', 'variables', 'missing', 'heatmap', 'dictionary']
     : ['overview', 'elements', 'summary', 'obligations', 'dictionary', 'regulatory']
@@ -78,6 +78,8 @@ export default function ProfilePage() {
     outliers:     'Outliers',
     heatmap:      'Quality Heatmap',
     dictionary:   'Data Dictionary',
+    duplicates:   'Duplicate Rows',
+    intelligence: 'AI Intelligence',
     schema:       'Schema Analysis',
     elements:     'Business Elements',
     summary:      'Summary',

@@ -53,6 +53,7 @@ export interface ExtractedFact {
 export interface ColumnProfile {
   column_name: string
   data_type: string
+  var_type?: string  // "Numeric" | "Text" | "Categorical" | "DateTime"
   semantic_type?: string
   missing_count: number
   missing_pct: number
@@ -61,6 +62,11 @@ export interface ColumnProfile {
   is_pii: boolean
   sensitivity: string
   business_definition?: string
+  // All-type stats
+  infinite_count?: number
+  infinite_pct?: number
+  memory_size?: number
+  // Numeric stats
   min?: number
   max?: number
   mean?: number
@@ -69,20 +75,62 @@ export interface ColumnProfile {
   variance?: number
   skewness?: number
   kurtosis?: number
+  percentile_5?: number
   percentile_25?: number
   percentile_75?: number
+  percentile_95?: number
   zeros_count?: number
+  zeros_pct?: number
   negative_count?: number
+  negative_pct?: number
+  mad?: number
+  cv?: number
+  sum_val?: number
+  monotonicity?: string
+  // Categorical / text stats
   top_values?: { value: string; count: number }[]
   mode?: string
   entropy?: number
+  // Text/Categorical length & unicode
+  max_length?: number
+  median_length?: number
+  mean_length?: number
+  min_length?: number
+  total_chars?: number
+  distinct_chars?: number
+  distinct_categories?: number
+  distinct_scripts?: number
+  distinct_blocks?: number
+  unique_exact_count?: number
+  unique_exact_pct?: number
+  word_frequencies?: { word: string; count: number }[]
+  char_frequencies?: { char: string; count: number }[]
+  sample_values?: string[]
+  length_histogram?: { length: number; count: number }[]
+  // DateTime stats
   min_date?: string
   max_date?: string
   freshness_days?: number
   has_gaps?: boolean
+  time_span_str?: string
+  has_time_component?: boolean
+  weekday_count?: number
+  weekend_count?: number
+  weekday_pct?: number
+  weekend_pct?: number
+  yearly_distribution?: { year: number; count: number }[]
+  monthly_distribution?: { month_num: number; month_name: string; count: number }[]
+  dow_distribution?: { dow: number; day_name: string; count: number }[]
+  hour_distribution?: { hour: number; count: number }[]
+  // Histograms / extremes
   histogram?: { bin_start: number; bin_end: number; count: number; label?: string }[]
   extreme_min?: { value: string | number; count: number }[]
   extreme_max?: { value: string | number; count: number }[]
+  // Per-column quality scores (0–100) — power the heatmap
+  completeness_score?: number
+  uniqueness_score?: number
+  validity_score?: number
+  consistency_score?: number
 }
 
 export interface ProfileContract {
@@ -128,8 +176,12 @@ export interface ProfileContract {
   audit_log?: { timestamp: string; event: string; detail: string }[]
   llm_used?: string
   duplicate_rows?: Record<string, any>[]
+  duplicate_row_groups?: Record<string, any>[]
   sample_head?: Record<string, any>[]
   sample_tail?: Record<string, any>[]
+  correlation_matrix?: Record<string, Record<string, number | null>>
+  missing_correlation_matrix?: Record<string, Record<string, number | null>>
+  numeric_sample_data?: Record<string, (number | null)[]>
 }
 
 export interface ProfileSummary {

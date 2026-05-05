@@ -8,9 +8,12 @@ from __future__ import annotations
 import os
 import uuid
 import math
+import unicodedata
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+import warnings
 import numpy as np
 import pandas as pd
 import re
@@ -18,6 +21,22 @@ import json as _json
 from groq import Groq
 from dotenv import load_dotenv
 load_dotenv()
+
+# ── Visions type inference (module-level singleton) ────────
+try:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        from visions import StandardSet
+        from visions.functional import infer_type as _visions_infer_type
+        _VISIONS_TYPESET: StandardSet | None = StandardSet()
+except Exception:
+    _VISIONS_TYPESET = None  # type: ignore[assignment]
+    _visions_infer_type = None  # type: ignore[assignment]
+
+_VISIONS_NUMERIC  = {"Integer", "Float", "Complex"}
+_VISIONS_DATETIME = {"DateTime", "Date", "Time", "TimeDelta"}
+_VISIONS_CAT      = {"Boolean", "Categorical"}
+_VISIONS_DIRTY    = {"Object", "Generic"}
 
 from backend.models.profile_contract import (
     ProfileContract,
@@ -106,42 +125,27 @@ def detect_sensitivity(col_name: str, is_pii: bool) -> SensitivityTier:
 
 def compute_health_score(df: pd.DataFrame, columns: list[ColumnProfile]) -> tuple[float, dict]:
     """
-    Weighted health score out of 100.
-    Completeness  40%  — how much data is present
-    Uniqueness    20%  — key columns aren't all duplicates
-    Consistency   20%  — data types are clean
-    Validity      20%  — no obvious impossible values
+    Dataset quality score (0–100), rounded to 2 decimal places.
+
+    Completeness = (total cells − missing cells) / total cells × 100
+    Uniqueness   = (total rows  − duplicate rows) / total rows  × 100
+    Health Score = (Completeness + Uniqueness) / 2
     """
-    total_cells = df.shape[0] * df.shape[1]
-    missing_cells = df.isnull().sum().sum()
-    completeness = ((total_cells - missing_cells) / total_cells) * 100 if total_cells > 0 else 0
+    total_rows  = len(df)
+    total_cols  = len(columns)
+    total_cells = total_rows * total_cols
 
-    # Uniqueness — average unique % across non-identifier columns
-    non_id_cols = [c for c in columns if c.semantic_type != "identifier"]
-    if non_id_cols:
-        uniqueness = sum(c.unique_pct for c in non_id_cols) / len(non_id_cols)
-    else:
-        uniqueness = 100.0
+    missing_cells = sum(c.missing_count for c in columns)
+    dup_rows      = int(df.duplicated().sum())
 
-    # Consistency — % of columns with clean dtypes (no mixed types)
-    consistency = 100.0  # we'll keep this simple for now
+    completeness = ((total_cells - missing_cells) / total_cells * 100) if total_cells > 0 else 100.0
+    uniqueness   = ((total_rows  - dup_rows)      / total_rows  * 100) if total_rows  > 0 else 100.0
 
-    # Validity — penalise columns with > 20% missing
-    high_missing = sum(1 for c in columns if c.missing_pct > 20)
-    validity = max(0, 100 - (high_missing / max(len(columns), 1)) * 100)
-
-    health = (
-        completeness * 0.40 +
-        uniqueness   * 0.20 +
-        consistency  * 0.20 +
-        validity     * 0.20
-    )
+    health = (completeness + uniqueness) / 2
 
     breakdown = {
         "completeness": round(completeness, 2),
-        "uniqueness":   round(uniqueness, 2),
-        "consistency":  round(consistency, 2),
-        "validity":     round(validity, 2),
+        "uniqueness":   round(uniqueness,   2),
     }
 
     return round(health, 2), breakdown
@@ -210,6 +214,132 @@ Respond ONLY with a JSON object. No markdown, no backticks:
         print(f"  [Lens] Column definitions failed: {e}")
         return {}
     
+def _detect_var_type(series: pd.Series, unique: int, total: int, semantic: str | None) -> str:
+    """
+    Determine the user-facing variable type using visions semantic inference
+    with heuristic fallbacks for dirty-data detection.
+    """
+    # ── 1. Unambiguous pandas native dtypes ───────────────
+    if pd.api.types.is_bool_dtype(series):
+        return "Categorical"
+    if pd.api.types.is_numeric_dtype(series):
+        return "Numeric"
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "DateTime"
+    if not (pd.api.types.is_object_dtype(series) or
+            pd.api.types.is_categorical_dtype(series)):
+        return "Unsupported"
+
+    clean = series.dropna()
+    n_clean = len(clean)
+    if n_clean == 0:
+        return "Categorical"
+
+    # ── 2. Visions semantic inference ─────────────────────
+    visions_type: str | None = None
+    if _VISIONS_TYPESET is not None:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                visions_type = str(_visions_infer_type(series, _VISIONS_TYPESET))
+        except Exception:
+            pass
+
+    if visions_type in _VISIONS_NUMERIC:
+        return "Numeric"
+    if visions_type in _VISIONS_DATETIME:
+        return "DateTime"
+    if visions_type in _VISIONS_CAT:
+        return "Categorical"
+    if visions_type in _VISIONS_DIRTY:
+        return "Unsupported"
+    # visions_type == "String" or None → apply dirty-data checks
+
+    # ── 3. Dirty-data checks ───────────────────────────────
+    sample_n = min(500, n_clean)
+    sample   = clean.head(sample_n)
+
+    # 3a. True mixed Python types (Excel: int cells + str cells in same column)
+    if visions_type is None:
+        py_types     = {type(v).__name__ for v in sample}
+        numeric_like = {"int", "float", "int64", "float64", "int32", "float32", "Decimal"}
+        if "str" in py_types and bool(py_types & numeric_like):
+            return "Unsupported"
+
+    # 3b. Mostly-dates-but-some-garbage (e.g. 95 % ISO dates + 5 % "N/A" strings)
+    try:
+        parsed_dates = pd.to_datetime(
+            sample.astype(str), errors="coerce", infer_datetime_format=True
+        )
+        date_ratio = float(parsed_dates.notna().sum()) / sample_n
+        if 0.4 < date_ratio < 1.0:
+            return "Unsupported"
+    except Exception:
+        pass
+
+    # 3c. Mostly-numerics-but-some-text (e.g. "1.5", "2.3", "ERROR", "3.1")
+    try:
+        numeric_ratio = float(pd.to_numeric(clean, errors="coerce").notna().sum()) / n_clean
+        if 0.05 < numeric_ratio < 0.95:
+            return "Unsupported"
+    except Exception:
+        pass
+
+    # ── 4. Semantic overrides for clean string columns ─────
+    if semantic in ("categorical_flag", "iso_currency", "country_code"):
+        return "Categorical"
+    if semantic in ("person_name", "address_component"):
+        return "Text"
+
+    # ── 5. Cardinality heuristic ───────────────────────────
+    ratio = unique / total if total > 0 else 0
+    if unique <= 50 or ratio < 0.15:
+        return "Categorical"
+    return "Text"
+
+
+def _unicode_scripts(chars: set[str]) -> int:
+    scripts: set[str] = set()
+    for c in chars:
+        cp = ord(c)
+        if 0x0041 <= cp <= 0x007A or 0x00C0 <= cp <= 0x024F:
+            scripts.add("Latin")
+        elif 0x0400 <= cp <= 0x04FF:
+            scripts.add("Cyrillic")
+        elif 0x0600 <= cp <= 0x06FF:
+            scripts.add("Arabic")
+        elif 0x4E00 <= cp <= 0x9FFF:
+            scripts.add("CJK")
+        elif 0x3040 <= cp <= 0x30FF:
+            scripts.add("Japanese")
+        elif 0x0900 <= cp <= 0x097F:
+            scripts.add("Devanagari")
+        elif 0x0020 <= cp <= 0x0040 or 0x005B <= cp <= 0x0060:
+            scripts.add("Common")
+        elif cp < 0x0020:
+            scripts.add("Control")
+        else:
+            scripts.add("Other")
+    return max(len(scripts), 1)
+
+
+def _unicode_blocks(chars: set[str]) -> int:
+    block_ranges = [
+        (0x0000, 0x007F), (0x0080, 0x00FF), (0x0100, 0x017F),
+        (0x0180, 0x024F), (0x0370, 0x03FF), (0x0400, 0x04FF),
+        (0x0600, 0x06FF), (0x0900, 0x097F), (0x3040, 0x309F),
+        (0x30A0, 0x30FF), (0x4E00, 0x9FFF), (0xAC00, 0xD7AF),
+    ]
+    found: set[int] = set()
+    for c in chars:
+        cp = ord(c)
+        for i, (lo, hi) in enumerate(block_ranges):
+            if lo <= cp <= hi:
+                found.add(i)
+                break
+    return max(len(found), 1)
+
+
 def profile_column(series: pd.Series) -> ColumnProfile:
     col_name = series.name
     is_pii = detect_pii(col_name)
@@ -219,10 +349,14 @@ def profile_column(series: pd.Series) -> ColumnProfile:
     total = len(series)
     missing = int(series.isnull().sum())
     unique = int(series.nunique())
+    var_type = _detect_var_type(series, unique, total, semantic)
+
+    mem_size = int(series.memory_usage(deep=True))
 
     base = ColumnProfile(
         column_name=col_name,
         data_type=str(series.dtype),
+        var_type=var_type,
         semantic_type=semantic,
         missing_count=missing,
         missing_pct=round((missing / total) * 100, 2) if total > 0 else 0.0,
@@ -230,63 +364,77 @@ def profile_column(series: pd.Series) -> ColumnProfile:
         unique_pct=round((unique / total) * 100, 2) if total > 0 else 0.0,
         is_pii=is_pii,
         sensitivity=sensitivity,
+        memory_size=mem_size,
+        infinite_count=0,
+        infinite_pct=0.0,
     )
 
-    # ── Numeric columns ──────────────────────
+    # ── Numeric columns ──────────────────────────────────────
     if pd.api.types.is_numeric_dtype(series):
-        clean = series.dropna()
-        if len(clean) > 0:
-            base.min = round(float(clean.min()), 4)
-            base.max = round(float(clean.max()), 4)
-            base.mean = round(float(clean.mean()), 4)
-            base.median = round(float(clean.median()), 4)
-            base.std_dev = round(float(clean.std()), 4)
+        # Infinite values
+        inf_count = int(np.isinf(series.replace({None: np.nan}).fillna(0)).sum())
+        base.infinite_count = inf_count
+        base.infinite_pct = round((inf_count / total) * 100, 2) if total > 0 else 0.0
+
+        clean = series.replace([np.inf, -np.inf], np.nan).dropna()
+        n = len(clean)
+        if n > 0:
+            mean_val = float(clean.mean())
+            std_val  = float(clean.std())
+            median_val = float(clean.median())
+            zeros = int((clean == 0).sum())
+            negs  = int((clean < 0).sum())
+
+            base.min      = round(float(clean.min()), 4)
+            base.max      = round(float(clean.max()), 4)
+            base.mean     = round(mean_val, 4)
+            base.median   = round(median_val, 4)
+            base.std_dev  = round(std_val, 4)
             base.variance = round(float(clean.var()), 4)
             base.skewness = round(float(clean.skew()), 4)
             base.kurtosis = round(float(clean.kurt()), 4)
+            base.percentile_5  = round(float(clean.quantile(0.05)), 4)
             base.percentile_25 = round(float(clean.quantile(0.25)), 4)
             base.percentile_75 = round(float(clean.quantile(0.75)), 4)
-            base.zeros_count = int((clean == 0).sum())
-            base.negative_count = int((clean < 0).sum())
+            base.percentile_95 = round(float(clean.quantile(0.95)), 4)
+            base.zeros_count    = zeros
+            base.zeros_pct      = round((zeros / total) * 100, 2) if total > 0 else 0.0
+            base.negative_count = negs
+            base.negative_pct   = round((negs / total) * 100, 2) if total > 0 else 0.0
+            base.mad     = round(float((clean - median_val).abs().median()), 4)
+            base.cv      = round(std_val / mean_val, 4) if mean_val != 0 else None
+            base.sum_val = round(float(clean.sum()), 4)
 
-    # ── Categorical / object columns ─────────
-    elif pd.api.types.is_object_dtype(series) or pd.api.types.is_categorical_dtype(series):
-        clean = series.dropna()
-        if len(clean) > 0:
-            vc = clean.value_counts()
-            base.top_values = [
-                {"value": str(k), "count": int(v)}
-                for k, v in vc.head(10).items()
-            ]
-            base.mode = str(vc.index[0]) if len(vc) > 0 else None
-            # Entropy
-            probs = vc / vc.sum()
-            base.entropy = round(float(-sum(p * math.log2(p) for p in probs if p > 0)), 4)
+            # Monotonicity
+            diffs = clean.diff().dropna()
+            if len(diffs) == 0:
+                base.monotonicity = "Non-monotonic"
+            elif (diffs >= 0).all():
+                base.monotonicity = "Increasing"
+            elif (diffs <= 0).all():
+                base.monotonicity = "Decreasing"
+            else:
+                base.monotonicity = "Non-monotonic"
 
-    # ── Datetime columns ──────────────────────
-    elif pd.api.types.is_datetime64_any_dtype(series):
-        clean = series.dropna()
-        if len(clean) > 0:
-            base.min_date = clean.min().to_pydatetime()
-            base.max_date = clean.max().to_pydatetime()
-            base.freshness_days = (datetime.utcnow() - clean.max().to_pydatetime()).days
-            # Gap detection — check if any expected dates are missing
-            date_range = pd.date_range(clean.min(), clean.max(), freq="D")
-            base.has_gaps = len(date_range) > unique
-    
-    # ── Histogram (numeric columns only) ─────
-    if pd.api.types.is_numeric_dtype(series):
-        clean = series.dropna()
-        if len(clean) > 0:
-            counts, bin_edges = np.histogram(clean, bins=min(20, len(clean.unique())))
+            # Histogram (50 bins)
+            n_bins = min(50, len(clean.unique()))
+            counts, bin_edges = np.histogram(clean, bins=n_bins)
             base.histogram = [
                 {
                     "bin_start": round(float(bin_edges[i]), 4),
-                    "bin_end":   round(float(bin_edges[i+1]), 4),
+                    "bin_end":   round(float(bin_edges[i + 1]), 4),
                     "count":     int(counts[i]),
                 }
                 for i in range(len(counts))
             ]
+
+            # Top values for Common Values tab
+            vc = clean.value_counts()
+            base.top_values = [
+                {"value": str(round(float(k), 4)), "count": int(v)}
+                for k, v in vc.head(20).items()
+            ]
+
             # Extreme values
             sorted_vals = clean.sort_values()
             base.extreme_min = [
@@ -298,20 +446,156 @@ def profile_column(series: pd.Series) -> ColumnProfile:
                 for v in sorted_vals.tail(10).unique()[::-1]
             ]
 
-    elif pd.api.types.is_object_dtype(series):
+    # ── Datetime columns ─────────────────────────────────────
+    elif pd.api.types.is_datetime64_any_dtype(series):
         clean = series.dropna()
         if len(clean) > 0:
-            vc = clean.value_counts()
-            # Use top values as histogram bars
+            min_dt = clean.min().to_pydatetime()
+            max_dt = clean.max().to_pydatetime()
+            base.min_date       = min_dt
+            base.max_date       = max_dt
+            base.freshness_days = (datetime.utcnow() - max_dt).days
+            date_range = pd.date_range(clean.min(), clean.max(), freq="D")
+            base.has_gaps = len(date_range) > unique
+
+            # Time span as human-readable string
+            try:
+                from dateutil.relativedelta import relativedelta as _rd
+                delta = _rd(max_dt, min_dt)
+                parts: list[str] = []
+                if delta.years:  parts.append(f"{delta.years} Year{'s' if delta.years != 1 else ''}")
+                if delta.months: parts.append(f"{delta.months} Month{'s' if delta.months != 1 else ''}")
+                if delta.days:   parts.append(f"{delta.days} Day{'s' if delta.days != 1 else ''}")
+                base.time_span_str = ", ".join(parts) if parts else "< 1 Day"
+            except Exception:
+                base.time_span_str = None
+
+            # Has time component?
+            base.has_time_component = bool(
+                (clean.dt.hour != 0).any() or
+                (clean.dt.minute != 0).any() or
+                (clean.dt.second != 0).any()
+            )
+
+            # Weekday / weekend split
+            is_weekday = clean.dt.dayofweek < 5
+            base.weekday_count = int(is_weekday.sum())
+            base.weekend_count = int((~is_weekday).sum())
+            n_clean = len(clean)
+            base.weekday_pct = round((base.weekday_count / n_clean) * 100, 2)
+            base.weekend_pct = round((base.weekend_count / n_clean) * 100, 2)
+
+            # Yearly distribution (sorted by year)
+            year_vc = clean.dt.year.value_counts().sort_index()
+            base.yearly_distribution = [
+                {"year": int(yr), "count": int(cnt)}
+                for yr, cnt in year_vc.items()
+            ]
+
+            # Monthly distribution (Jan=1 … Dec=12, always sorted)
+            MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun",
+                           "Jul","Aug","Sep","Oct","Nov","Dec"]
+            month_vc = clean.dt.month.value_counts().reindex(range(1, 13), fill_value=0).sort_index()
+            base.monthly_distribution = [
+                {"month_num": int(m), "month_name": MONTH_NAMES[m - 1], "count": int(cnt)}
+                for m, cnt in month_vc.items()
+            ]
+
+            # Day-of-week distribution (Mon=0 … Sun=6)
+            DOW_NAMES = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+            dow_vc = clean.dt.dayofweek.value_counts().reindex(range(7), fill_value=0).sort_index()
+            base.dow_distribution = [
+                {"dow": int(d), "day_name": DOW_NAMES[d], "count": int(cnt)}
+                for d, cnt in dow_vc.items()
+            ]
+
+            # Hour distribution (0-23, only populated when time component present)
+            if base.has_time_component:
+                hour_vc = clean.dt.hour.value_counts().reindex(range(24), fill_value=0).sort_index()
+                base.hour_distribution = [
+                    {"hour": int(h), "count": int(cnt)}
+                    for h, cnt in hour_vc.items()
+                ]
+
+    # ── Text / Categorical columns ────────────────────────────
+    if var_type in ("Text", "Categorical"):
+        clean = series.dropna()
+        n = len(clean)
+        if n > 0:
+            str_series = clean.astype(str)
+            vc = str_series.value_counts()
+
+            # top values
+            base.top_values = [
+                {"value": str(k), "count": int(v)}
+                for k, v in vc.head(20).items()
+            ]
+            base.mode = str(vc.index[0]) if len(vc) > 0 else None
+            probs = vc / vc.sum()
+            base.entropy = round(float(-sum(p * math.log2(p) for p in probs if p > 0)), 4)
+
+            # Length stats
+            lengths = str_series.str.len()
+            base.max_length    = int(lengths.max())
+            base.median_length = round(float(lengths.median()), 2)
+            base.mean_length   = round(float(lengths.mean()), 2)
+            base.min_length    = int(lengths.min())
+
+            # Unique exact (appears exactly once)
+            exact = int((vc == 1).sum())
+            base.unique_exact_count = exact
+            base.unique_exact_pct   = round((exact / total) * 100, 2) if total > 0 else 0.0
+
+            # Sample values
+            base.sample_values = [str(v) for v in clean.head(5).tolist()]
+
+            # Unicode analysis on a sample (up to 50 k chars for performance)
+            sample_text = " ".join(str_series.tolist())[:50_000]
+            all_chars = list(sample_text)
+            char_set  = set(sample_text)
+
+            base.total_chars      = len(sample_text)
+            base.distinct_chars   = len(char_set)
+            base.distinct_categories = len({unicodedata.category(c) for c in char_set})
+            base.distinct_scripts = _unicode_scripts(char_set)
+            base.distinct_blocks  = _unicode_blocks(char_set)
+
+            # Char frequencies
+            char_counter = Counter(sample_text)
+            base.char_frequencies = [
+                {"char": c, "count": cnt}
+                for c, cnt in char_counter.most_common(30)
+                if c.strip()
+            ]
+
+            # Word frequencies
+            all_words: list[str] = []
+            for text in str_series.tolist():
+                all_words.extend(re.findall(r"\b\w+\b", text.lower()))
+            word_counter = Counter(all_words)
+            base.word_frequencies = [
+                {"word": w, "count": cnt}
+                for w, cnt in word_counter.most_common(50)
+            ]
+
+            # Histogram for display (categorical bar chart — top 20 by value count)
             base.histogram = [
                 {
                     "bin_start": 0,
                     "bin_end":   0,
                     "count":     int(v),
-                    "label":     str(k)[:20],
+                    "label":     str(k)[:25],
                 }
                 for k, v in vc.head(20).items()
             ]
+
+            # Length histogram for categorical Categories tab
+            lvc = lengths.value_counts().sort_index()
+            base.length_histogram = [
+                {"length": int(length), "count": int(cnt)}
+                for length, cnt in lvc.items()
+            ]
+
             base.extreme_min = [
                 {"value": str(k), "count": int(v)}
                 for k, v in vc.tail(10).items()
@@ -320,6 +604,41 @@ def profile_column(series: pd.Series) -> ColumnProfile:
                 {"value": str(k), "count": int(v)}
                 for k, v in vc.head(10).items()
             ]
+
+    # ── Per-column quality scores (0-100) ────────────────────
+    n_non_null = total - missing
+
+    # 1. Completeness
+    base.completeness_score = round((n_non_null / total) * 100, 2) if total > 0 else 0.0
+
+    # 2. Uniqueness: distinct / non-null
+    base.uniqueness_score = round(min((unique / n_non_null) * 100, 100.0), 2) if n_non_null > 0 else 0.0
+
+    # 3. Validity: type purity — "Unsupported" means mixed types
+    base.validity_score = 70.0 if var_type == "Unsupported" else 100.0
+
+    # 4. Consistency
+    if var_type == "Numeric" and base.mean is not None and base.std_dev is not None:
+        clean_num = series.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(clean_num) > 0:
+            if base.std_dev > 0:
+                within_3std = int(((clean_num - base.mean).abs() <= 3 * base.std_dev).sum())
+                base.consistency_score = round((within_3std / len(clean_num)) * 100, 2)
+            else:
+                base.consistency_score = 100.0
+        else:
+            base.consistency_score = 100.0
+    elif var_type in ("Categorical", "Text"):
+        clean_str = series.dropna().astype(str)
+        if len(clean_str) > 0 and total > 0:
+            vc = clean_str.value_counts()
+            # Ultra-rare: categories with < 1 % of total rows
+            ultra_rare_total = int(vc[vc / total < 0.01].sum())
+            base.consistency_score = round(max(0.0, 100.0 - (ultra_rare_total / total) * 100.0), 2)
+        else:
+            base.consistency_score = 100.0
+    else:
+        base.consistency_score = 100.0
 
     return base
 
@@ -505,6 +824,63 @@ def profile_structured(
     dup_mask = df.duplicated(keep=False)
     duplicate_rows = rows_to_dict(df[dup_mask].head(20)) if dup_mask.any() else []
 
+    # ── Duplicate groups with frequency counts ─
+    duplicate_row_groups: list[dict] = []
+    if dup_mask.any():
+        try:
+            str_df = df.astype(str)  # make all cols hashable
+            grp = (
+                str_df[dup_mask]
+                .groupby(list(str_df.columns), as_index=False)
+                .size()
+                .rename(columns={"size": "__count__"})
+                .sort_values("__count__", ascending=False)
+                .head(50)
+            )
+            duplicate_row_groups = grp.to_dict(orient="records")
+        except Exception:
+            duplicate_row_groups = []
+
+    # ── Pearson correlation matrix (numeric cols) ─
+    correlation_matrix: dict | None = None
+    numeric_col_names = [c.column_name for c in columns if c.var_type == "Numeric"]
+    if len(numeric_col_names) >= 2:
+        try:
+            numeric_df = df[numeric_col_names].apply(pd.to_numeric, errors="coerce")
+            corr = numeric_df.corr(method="pearson").round(4)
+            correlation_matrix = {
+                col: {other: (None if pd.isna(v) else float(v)) for other, v in row.items()}
+                for col, row in corr.to_dict().items()
+            }
+        except Exception:
+            pass
+
+    # ── Numeric sample data (for hexbin endpoint) ─────────
+    numeric_sample_data: dict | None = None
+    if numeric_col_names:
+        try:
+            def _safe_float(v):
+                return None if pd.isna(v) else float(v)
+            numeric_sample_data = {
+                col: [_safe_float(v) for v in df[col].head(5000)]
+                for col in numeric_col_names
+            }
+        except Exception:
+            pass
+
+    # ── Missing-value correlation matrix ─────────────────
+    missing_correlation_matrix: dict | None = None
+    try:
+        miss_ind = df.isna().astype(float)
+        # Columns with zero variance in missingness would yield NaN corr — keep them
+        miss_corr = miss_ind.corr(method="pearson").round(3)
+        missing_correlation_matrix = {
+            col: {other: (None if pd.isna(v) else float(v)) for other, v in row.items()}
+            for col, row in miss_corr.to_dict().items()
+        }
+    except Exception:
+        pass
+
     # ── Cross-column intelligence ─────────────
     print("  [Lens] Generating cross-column intelligence...")
     cross_column_intelligence = generate_cross_column_intelligence(df, columns)
@@ -521,9 +897,13 @@ def profile_structured(
         column_count=len(df.columns),
         duplicate_row_count=int(df.duplicated().sum()),
         duplicate_rows=duplicate_rows,
+        duplicate_row_groups=duplicate_row_groups,
         sample_head=sample_head,
         sample_tail=sample_tail,
         columns=columns,
+        correlation_matrix=correlation_matrix,
+        missing_correlation_matrix=missing_correlation_matrix,
+        numeric_sample_data=numeric_sample_data,
         health_score=health,
         health_breakdown=breakdown,
         drift_alerts=drift_alerts,

@@ -15,6 +15,10 @@ ydata-profiling==4.18.4
 openpyxl==3.1.5
 xlrd==2.0.1
 scipy>=1.14.1,<1.17
+wordcloud>=1.9.3
+matplotlib>=3.8.0
+seaborn>=0.13.0
+pillow>=10.0.0
 
 # Unstructured document processing
 docling==2.5.0

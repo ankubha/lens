@@ -45,13 +45,13 @@ export default function HealthGauge({ score, breakdown, size = 'lg' }: Props) {
           textAlign: 'center',
         }}>
           <div style={{
-            fontSize: size === 'lg' ? 26 : 16,
+            fontSize: size === 'lg' ? 22 : 14,
             fontWeight: 600,
             color,
             lineHeight: 1,
             fontFamily: 'var(--font-display)',
           }}>
-            {score.toFixed(0)}
+            {score.toFixed(2)}
           </div>
           {size === 'lg' && (
             <div style={{ fontSize: 10, color: 'var(--ink-3)', marginTop: 2 }}>/100</div>
@@ -100,7 +100,7 @@ export default function HealthGauge({ score, breakdown, size = 'lg' }: Props) {
                 width: 36,
                 textAlign: 'right',
               }}>
-                {val.toFixed(0)}%
+                {val.toFixed(2)}%
               </span>
             </div>
           ))}

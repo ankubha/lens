@@ -428,25 +428,32 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
 
 // ── Main component ────────────────────────────────────────
 function UnstructuredProfile({ profile, activeTab }: Props) {
-  const [wantsPageSummary, setWantsPageSummary] = useState<boolean | null>(null)
-  const [selectedPage, setSelectedPage]         = useState<number>(1)
-  const [pageSummaries, setPageSummaries]       = useState<{ page: number; summary: string; key_entities: string[] }[]>([])
-  const [loadingPages, setLoadingPages]         = useState(false)
-  const [fryResults, setFryResults]             = useState<any>(null)
-  const [fryFilter, setFryFilter]               = useState('all')
+  const [selectedPage, setSelectedPage]   = useState<number>(1)
+  const [pageResult, setPageResult]       = useState<{ page: number; summary: string; key_entities: string[] } | null>(null)
+  const [loadingPage, setLoadingPage]     = useState(false)
+  const [pageError, setPageError]         = useState('')
+  const [fryResults, setFryResults]       = useState<any>(null)
+  const [fryFilter, setFryFilter]         = useState('all')
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
 
-  const fetchPageSummaries = async () => {
-    setLoadingPages(true)
+  const fetchPageSummary = async (page: number) => {
+    setLoadingPage(true)
+    setPageError('')
+    setPageResult(null)
     try {
-      const res  = await fetch(`${API_BASE}/api/profiles/${profile.profile_id}/page-summaries`)
+      const res  = await fetch(`${API_BASE}/api/profiles/${profile.profile_id}/page-summary`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ page }),
+      })
       const data = await res.json()
-      if (data.page_summaries) setPageSummaries(data.page_summaries)
-    } catch (e) {
-      console.error('Failed to fetch page summaries:', e)
+      if (!res.ok) throw new Error(data.detail || 'Summary generation failed')
+      setPageResult(data)
+    } catch (e: any) {
+      setPageError(e.message || 'Failed to generate summary')
     } finally {
-      setLoadingPages(false)
+      setLoadingPage(false)
     }
   }
 
@@ -598,72 +605,77 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
           </details>
         )}
 
-        {profile.raw_llm_narrative && (
-          <details style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}>
-            <summary style={{ padding: '16px 20px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, listStyle: 'none', borderBottom: '0.5px solid var(--border-1)', background: 'var(--surface-2)' }}>
-              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>CRO Risk Narrative</span>
-              <Badge variant="warning" label="Free-form analysis" />
-            </summary>
-            <div style={{ padding: '24px' }}><MarkdownText text={profile.raw_llm_narrative} fontSize={14} /></div>
-          </details>
-        )}
+        <Card title="Page-by-Page Summary" subtitle="Select a page · LLM generates the summary on demand">
+          <div style={{ padding: '24px' }}>
 
-        <Card title="Page-by-Page Summary" subtitle="On demand · Lazy loaded">
-          <div style={{ padding: '20px 24px' }}>
-            {wantsPageSummary === null && (
-              <div style={{ textAlign: 'center' }}>
-                <p style={{ fontSize: 14, color: 'var(--ink-2)', marginBottom: 16, lineHeight: 1.7 }}>
-                  Generate a 2-3 sentence summary for each page. Takes approximately {Math.ceil((profile.page_count || 15) * 3 / 60)} minutes.
-                </p>
-                <div style={{ display: 'flex', gap: 12, justifyContent: 'center' }}>
-                  <button onClick={() => { setWantsPageSummary(true); fetchPageSummaries() }} style={{ padding: '10px 24px', borderRadius: 'var(--radius-md)', background: 'var(--wf-red)', color: 'white', border: 'none', fontSize: 13, fontWeight: 500, cursor: 'pointer', fontFamily: 'var(--font-body)' }}>
-                    Yes, generate page summaries
-                  </button>
-                  <button onClick={() => setWantsPageSummary(false)} style={{ padding: '10px 24px', borderRadius: 'var(--radius-md)', background: 'transparent', color: 'var(--ink-2)', border: '0.5px solid var(--border-2)', fontSize: 13, cursor: 'pointer', fontFamily: 'var(--font-body)' }}>
-                    No thanks
-                  </button>
-                </div>
-              </div>
-            )}
-            {wantsPageSummary === false && (
-              <p style={{ fontSize: 13, color: 'var(--ink-3)', textAlign: 'center' }}>
-                Page summaries skipped.{' '}
-                <button onClick={() => setWantsPageSummary(null)} style={{ color: 'var(--wf-red)', background: 'none', border: 'none', cursor: 'pointer', fontSize: 13, textDecoration: 'underline' }}>Change mind?</button>
-              </p>
-            )}
-            {wantsPageSummary === true && loadingPages && (
-              <div style={{ textAlign: 'center', padding: '20px' }}>
-                <div style={{ width: 36, height: 36, border: '3px solid var(--surface-tertiary)', borderTop: '3px solid var(--wf-red)', borderRadius: '50%', margin: '0 auto 12px', animation: 'spin 1s linear infinite' }}/>
-                <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-                <p style={{ fontSize: 13, color: 'var(--ink-3)' }}>Generating page summaries...</p>
-              </div>
-            )}
-            {wantsPageSummary === true && !loadingPages && pageSummaries.length === 0 && (
-              <p style={{ fontSize: 13, color: 'var(--ink-3)', textAlign: 'center' }}>No page summaries available. Re-upload the file to enable this feature.</p>
-            )}
-            {wantsPageSummary === true && !loadingPages && pageSummaries.length > 0 && (
-              <div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16, padding: '12px 16px', background: 'var(--surface-2)', borderRadius: 'var(--radius-md)', border: '0.5px solid var(--border-1)' }}>
-                  <span style={{ fontSize: 13, color: 'var(--ink-2)', fontWeight: 500 }}>Select page:</span>
-                  <select value={selectedPage} onChange={e => setSelectedPage(Number(e.target.value))} style={{ padding: '6px 12px', borderRadius: 'var(--radius-md)', border: '0.5px solid var(--border-2)', fontSize: 13, color: 'var(--ink)', background: 'var(--surface)', fontFamily: 'var(--font-body)', cursor: 'pointer' }}>
-                    {pageSummaries.map(ps => <option key={ps.page} value={ps.page}>Page {ps.page}</option>)}
-                  </select>
-                  <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>of {profile.page_count} pages</span>
-                </div>
-                {pageSummaries.filter(ps => ps.page === selectedPage).map(ps => (
-                  <div key={ps.page}>
-                    <div style={{ fontSize: 13, color: 'var(--ink-2)', lineHeight: 1.8, marginBottom: 12 }}>{ps.summary}</div>
-                    {ps.key_entities.length > 0 && (
-                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                        {ps.key_entities.map((e, i) => (
-                          <span key={i} style={{ fontSize: 11, background: 'var(--wf-gold-light)', color: 'var(--wf-gold-dark)', padding: '2px 8px', borderRadius: 4, border: '0.5px solid rgba(201,162,39,0.3)' }}>{e}</span>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+            {/* Page selector row */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-2)' }}>Select page:</span>
+              <select
+                value={selectedPage}
+                onChange={e => { setSelectedPage(Number(e.target.value)); setPageResult(null); setPageError('') }}
+                style={{ padding: '7px 14px', borderRadius: 'var(--radius-md)', border: '0.5px solid var(--border-2)', fontSize: 13, color: 'var(--ink)', background: 'var(--surface)', fontFamily: 'var(--font-body)', cursor: 'pointer', minWidth: 140 }}
+              >
+                {Array.from({ length: profile.page_count || 1 }, (_, i) => (
+                  <option key={i + 1} value={i + 1}>Page {i + 1}</option>
                 ))}
+              </select>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>of {profile.page_count} pages</span>
+              <button
+                onClick={() => fetchPageSummary(selectedPage)}
+                disabled={loadingPage}
+                style={{ padding: '7px 20px', borderRadius: 'var(--radius-md)', background: loadingPage ? 'var(--surface-3)' : 'var(--wf-red)', color: loadingPage ? 'var(--ink-3)' : 'white', border: 'none', fontSize: 13, fontWeight: 500, cursor: loadingPage ? 'default' : 'pointer', fontFamily: 'var(--font-body)', transition: 'all 0.15s ease' }}
+              >
+                {loadingPage ? 'Generating…' : 'Generate Summary'}
+              </button>
+            </div>
+
+            {/* Loading */}
+            {loadingPage && (
+              <div style={{ textAlign: 'center', padding: '28px' }}>
+                <div style={{ width: 36, height: 36, border: '3px solid var(--surface-tertiary)', borderTop: '3px solid var(--wf-red)', borderRadius: '50%', margin: '0 auto 14px', animation: 'spin 1s linear infinite' }}/>
+                <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+                <p style={{ fontSize: 13, color: 'var(--ink-3)' }}>Asking LLM to summarise page {selectedPage}…</p>
               </div>
             )}
+
+            {/* Error */}
+            {pageError && !loadingPage && (
+              <div style={{ padding: '12px 16px', background: 'var(--wf-red-light)', border: '0.5px solid rgba(215,30,43,0.3)', borderRadius: 'var(--radius-md)', color: 'var(--wf-red)', fontSize: 13 }}>
+                {pageError}
+              </div>
+            )}
+
+            {/* Result */}
+            {pageResult && !loadingPage && (
+              <div style={{ background: 'var(--surface-2)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-md)', padding: '20px 24px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+                  <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 10, background: 'var(--wf-gold-light)', color: 'var(--wf-gold-dark)', border: '0.5px solid rgba(201,162,39,0.3)' }}>
+                    Page {pageResult.page}
+                  </span>
+                  <span style={{ fontSize: 11, color: 'var(--ink-3)', fontStyle: 'italic' }}>AI-generated · Llama 4 Scout</span>
+                </div>
+                <p style={{ fontSize: 14, color: 'var(--ink-2)', lineHeight: 1.8, margin: '0 0 14px 0' }}>{pageResult.summary}</p>
+                {pageResult.key_entities.length > 0 && (
+                  <div>
+                    <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 8 }}>Key entities on this page</div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {pageResult.key_entities.map((e, i) => (
+                        <span key={i} style={{ fontSize: 12, background: 'var(--surface)', color: 'var(--ink-2)', padding: '3px 10px', borderRadius: 4, border: '0.5px solid var(--border-2)' }}>{e}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Prompt before any action */}
+            {!pageResult && !loadingPage && !pageError && (
+              <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--ink-3)', fontSize: 13 }}>
+                Select a page above and click <strong style={{ color: 'var(--ink-2)' }}>Generate Summary</strong> — the LLM will summarise only that page.
+              </div>
+            )}
+
           </div>
         </Card>
 

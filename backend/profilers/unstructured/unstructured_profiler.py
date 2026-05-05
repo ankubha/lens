@@ -892,6 +892,9 @@ def profile_unstructured(
             key_dates=key_dates,
             additional_findings=additional,
             raw_llm_narrative=narrative,
+            # Store truncated page texts so on-demand per-page summaries work
+            # even after the uploaded PDF has been deleted.
+            page_texts=[t[:4000] for t in page_texts],
             audit_log=audit_log,
             llm_used="llama-4-scout-17b",
             deterministic_only=False,

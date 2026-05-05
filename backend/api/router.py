@@ -6,6 +6,7 @@ Upload any file → get a ProfileContract back.
 """
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import Response
 from pathlib import Path
 import shutil
 import uuid
@@ -147,57 +148,116 @@ def get_profile(profile_id: str):
 
 # ── Page summaries (lazy loaded) ──────────────────────────
 
-@router.get("/profiles/{profile_id}/page-summaries")
-def get_page_summaries(profile_id: str):
+# ── Per-page summary (on-demand, single page via LLM) ─────
+
+class PageSummaryRequest(PydanticBase):
+    page: int   # 1-indexed
+
+@router.post("/profiles/{profile_id}/page-summary")
+def get_single_page_summary(profile_id: str, req: PageSummaryRequest):
     """
-    Generate page-by-page summaries on demand.
-    Lazy loaded — only called when user requests them.
+    Generate an LLM summary for a single page on demand.
+    Uses stored page_texts so the original PDF is not needed.
     """
+    import os
+    from groq import Groq
+
     if profile_id not in profile_store:
-        raise HTTPException(status_code=404, detail=f"Profile '{profile_id}' not found.")
+        raise HTTPException(404, f"Profile '{profile_id}' not found.")
 
     contract = profile_store[profile_id]
 
     if contract.modality != DataModality.UNSTRUCTURED:
-        raise HTTPException(status_code=400, detail="Page summaries only available for unstructured documents.")
+        raise HTTPException(400, "Page summaries only available for unstructured documents.")
 
-    if contract.summary and contract.summary.page_summaries:
-        return {"page_summaries": contract.summary.page_summaries}
+    page_idx = req.page - 1
+    if not contract.page_texts or page_idx < 0 or page_idx >= len(contract.page_texts):
+        raise HTTPException(404, f"Page {req.page} text not available — re-upload the file.")
 
-    # Generate on demand using saved file path from audit log
-    from backend.profilers.unstructured.unstructured_profiler import (
-        generate_page_summaries
-    )
-    import pdfplumber
-    from pathlib import Path
-
-    # Find file in uploads folder
-    uploads = Path("uploads")
-    pdf_files = list(uploads.glob("*.pdf"))
-
-    if not pdf_files:
+    page_text = contract.page_texts[page_idx].strip()
+    if not page_text:
         return {
-            "page_summaries": [],
-            "message": "Original file not available for page summary generation. Re-upload to enable.",
+            "page":     req.page,
+            "summary":  "This page appears to contain no extractable text (possibly a scanned image or blank page).",
+            "key_entities": [],
         }
 
-    # Use most recent PDF
-    latest_pdf = max(pdf_files, key=lambda p: p.stat().st_mtime)
+    import re as _re, json as _json
+
+    def _extract_json(text: str) -> dict:
+        """
+        Robustly extract a JSON object from LLM output.
+        Handles markdown fences, surrounding prose, and partial wrapping.
+        """
+        text = text.strip()
+
+        # 1. Strip any ``` fences
+        text = _re.sub(r"^```(?:json)?\s*", "", text)
+        text = _re.sub(r"\s*```$", "", text)
+        text = text.strip()
+
+        # 2. Try direct parse first
+        try:
+            return _json.loads(text)
+        except _json.JSONDecodeError:
+            pass
+
+        # 3. Find the first { … } block in the response (handles prose around JSON)
+        match = _re.search(r"\{[\s\S]*\}", text)
+        if match:
+            try:
+                return _json.loads(match.group())
+            except _json.JSONDecodeError:
+                pass
+
+        # 4. Complete fallback — return the raw text as a plain summary
+        return {"summary": text if text else "No summary could be generated.", "key_entities": []}
 
     try:
-        with pdfplumber.open(latest_pdf) as pdf:
-            page_texts = [page.extract_text() or "" for page in pdf.pages]
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-        page_summaries = generate_page_summaries(page_texts, max_pages=min(15, len(page_texts)))
+        prompt = f"""You are a senior financial analyst reviewing a legal/financial document.
 
-        # Cache in profile
-        if contract.summary:
-            contract.summary.page_summaries = page_summaries
-        
-        return {"page_summaries": page_summaries}
+Summarise page {req.page} of the document using ONLY the text provided below.
+
+Return ONLY a JSON object in this exact format with no other text before or after it:
+{{"summary": "2-4 sentence summary of what this page covers.", "key_entities": ["entity1", "entity2"]}}
+
+Rules:
+- summary: 2-4 complete sentences describing the page content.
+- key_entities: up to 6 items — names, amounts, dates, clauses, or key terms from this page.
+- No markdown, no explanation, no code fences — just the raw JSON object.
+
+Page {req.page} text:
+\"\"\"
+{page_text[:3500]}
+\"\"\""""
+
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a precise JSON-generating assistant. Always respond with only a valid JSON object — no markdown, no preamble, no explanation.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=600,
+            response_format={"type": "json_object"},
+        )
+
+        raw    = response.choices[0].message.content or ""
+        parsed = _extract_json(raw)
+
+        return {
+            "page":         req.page,
+            "summary":      parsed.get("summary") or "Summary not available.",
+            "key_entities": parsed.get("key_entities") or [],
+        }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Page summary generation failed: {str(e)}")
+        raise HTTPException(500, f"Page summary generation failed: {str(e)}")
 
 
 # ── Health check ──────────────────────────────────────────
@@ -294,6 +354,451 @@ def validate_fry14(profile_id: str):
             for r in results
         ],
     }
+
+# ── Word Cloud image ──────────────────────────────────────
+
+@router.get("/profiles/{profile_id}/wordcloud/{column_name}")
+def get_wordcloud(profile_id: str, column_name: str):
+    """Generate a compact word cloud PNG for a text/categorical column."""
+    import io, random
+
+    if profile_id not in profile_store:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    profile = profile_store[profile_id]
+    col = next((c for c in profile.columns if c.column_name == column_name), None)
+
+    if not col or not col.word_frequencies:
+        raise HTTPException(status_code=404, detail="No word frequency data for this column")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        from wordcloud import WordCloud
+
+        word_freq = {w["word"]: w["count"] for w in col.word_frequencies}
+
+        # Palette matching the reference image: greens, purples, blues, teals, indigo
+        _palette = [
+            "#1B5E20", "#2E7D32", "#388E3C", "#43A047", "#558B2F", "#689F38",
+            "#4A148C", "#6A1B9A", "#7B1FA2", "#8E24AA", "#AB47BC",
+            "#0D47A1", "#1565C0", "#1976D2", "#1E88E5",
+            "#004D40", "#00695C", "#00796B", "#00897B", "#26A69A",
+            "#1A237E", "#283593", "#303F9F", "#3949AB",
+            "#33691E", "#558B2F",
+        ]
+
+        def _color_func(word, font_size, position, orientation, random_state=None, **kwargs):
+            rng = random_state if random_state is not None else random.Random(hash(word))
+            return rng.choice(_palette)
+
+        wc = WordCloud(
+            width=900,
+            height=420,
+            background_color="white",
+            max_words=120,
+            color_func=_color_func,
+            prefer_horizontal=0.65,
+            min_font_size=9,
+            max_font_size=90,
+            relative_scaling=0.55,
+            collocations=False,
+            margin=4,
+        ).generate_from_frequencies(word_freq)
+
+        buf = io.BytesIO()
+        wc.to_image().save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+
+        return Response(
+            content=buf.read(),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="wordcloud library not installed. Run: pip install wordcloud",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Word cloud generation failed: {str(e)}")
+
+
+# ── DateTime distribution chart ───────────────────────────
+
+@router.get("/profiles/{profile_id}/datetime_chart/{column_name}")
+def get_datetime_chart(profile_id: str, column_name: str, bin: str = "timeline"):
+    """
+    Generate a DateTime analysis chart as PNG.
+    bin = timeline | year | month | dow | hour
+    Uses pre-aggregated distributions stored in the ColumnProfile.
+    """
+    import io
+
+    if profile_id not in profile_store:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    profile = profile_store[profile_id]
+    col = next((c for c in profile.columns if c.column_name == column_name), None)
+
+    if not col:
+        raise HTTPException(status_code=404, detail="Column not found")
+    if col.var_type != "DateTime":
+        raise HTTPException(status_code=400, detail="Column is not a DateTime type")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as mticker
+        import numpy as np
+
+        # ── Wells Fargo palette ─────────────────────────────
+        WF_RED    = "#D71E2B"
+        WF_GOLD   = "#FFCD41"
+        BG        = "#FFFFFF"
+        GRID_CLR  = "#E5E7EB"
+        TEXT_CLR  = "#374151"
+        TICK_CLR  = "#6B7280"
+
+        fig, ax = plt.subplots(figsize=(10, 4.2), facecolor=BG)
+        ax.set_facecolor(BG)
+        ax.grid(axis="y", color=GRID_CLR, linewidth=0.7, zorder=0)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_color(GRID_CLR)
+        ax.spines["bottom"].set_color(GRID_CLR)
+        ax.tick_params(colors=TICK_CLR, labelsize=9)
+
+        def _bar(labels, counts, xlabel, title, color=WF_RED, rotate=0):
+            x = np.arange(len(labels))
+            bars = ax.bar(x, counts, color=color, width=0.65, zorder=3,
+                          edgecolor="white", linewidth=0.5)
+            ax.set_xticks(x)
+            ax.set_xticklabels(labels, rotation=rotate, ha="right" if rotate else "center",
+                               fontsize=9, color=TICK_CLR)
+            ax.set_xlabel(xlabel, fontsize=10, color=TEXT_CLR, labelpad=8)
+            ax.set_ylabel("Record Count", fontsize=10, color=TEXT_CLR, labelpad=8)
+            ax.set_title(title, fontsize=12, fontweight="bold", color=TEXT_CLR, pad=12)
+            # Value labels on bars
+            for bar in bars:
+                h = bar.get_height()
+                if h > 0:
+                    ax.text(bar.get_x() + bar.get_width() / 2, h + max(counts) * 0.01,
+                            f"{int(h):,}", ha="center", va="bottom", fontsize=7.5,
+                            color=TEXT_CLR, fontweight="500")
+            ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+                lambda v, _: f"{int(v):,}" if v >= 1000 else str(int(v))))
+
+        # ── Pick the right chart ────────────────────────────
+        if bin == "year" and col.yearly_distribution:
+            data  = col.yearly_distribution
+            lbls  = [str(d["year"]) for d in data]
+            cnts  = [d["count"]     for d in data]
+            _bar(lbls, cnts, "Year", f"Record Count by Year — {column_name}",
+                 rotate=45 if len(lbls) > 10 else 0)
+
+        elif bin == "month" and col.monthly_distribution:
+            data  = col.monthly_distribution
+            lbls  = [d["month_name"] for d in data]
+            cnts  = [d["count"]      for d in data]
+            _bar(lbls, cnts, "Month", f"Record Count by Month — {column_name}", color=WF_GOLD)
+
+        elif bin == "dow" and col.dow_distribution:
+            data  = col.dow_distribution
+            lbls  = [d["day_name"] for d in data]
+            cnts  = [d["count"]    for d in data]
+            # Weekend bars highlighted
+            colors = [WF_GOLD if d["dow"] >= 5 else WF_RED for d in data]
+            x = range(len(lbls))
+            bars = ax.bar(x, cnts, color=colors, width=0.55, zorder=3,
+                          edgecolor="white", linewidth=0.5)
+            ax.set_xticks(list(x))
+            ax.set_xticklabels(lbls, fontsize=10, color=TICK_CLR)
+            ax.set_xlabel("Day of Week", fontsize=10, color=TEXT_CLR, labelpad=8)
+            ax.set_ylabel("Record Count", fontsize=10, color=TEXT_CLR, labelpad=8)
+            ax.set_title(f"Record Count by Day of Week — {column_name}",
+                         fontsize=12, fontweight="bold", color=TEXT_CLR, pad=12)
+            for bar in bars:
+                h = bar.get_height()
+                if h > 0:
+                    ax.text(bar.get_x() + bar.get_width() / 2, h + max(cnts) * 0.01,
+                            f"{int(h):,}", ha="center", va="bottom", fontsize=8,
+                            color=TEXT_CLR, fontweight="500")
+            ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+                lambda v, _: f"{int(v):,}" if v >= 1000 else str(int(v))))
+            # Legend
+            from matplotlib.patches import Patch
+            ax.legend(handles=[Patch(color=WF_RED, label="Weekday"),
+                                Patch(color=WF_GOLD, label="Weekend")],
+                      fontsize=9, framealpha=0.8, loc="upper right")
+
+        elif bin == "hour" and col.hour_distribution:
+            data  = col.hour_distribution
+            lbls  = [f"{d['hour']:02d}:00" for d in data]
+            cnts  = [d["count"]            for d in data]
+            _bar(lbls, cnts, "Hour of Day", f"Record Count by Hour — {column_name}",
+                 color="#6366F1", rotate=45)
+
+        else:
+            # Default: timeline using yearly distribution (most universally useful)
+            data = col.yearly_distribution or []
+            if not data:
+                data = col.monthly_distribution or []
+                lbls = [d["month_name"] for d in data]
+                title = f"Timeline by Month — {column_name}"
+            else:
+                lbls = [str(d["year"]) for d in data]
+                title = f"Timeline by Year — {column_name}"
+            cnts = [d["count"] for d in data]
+            if lbls:
+                x = range(len(lbls))
+                ax.fill_between(x, cnts, alpha=0.18, color=WF_RED)
+                ax.plot(x, cnts, color=WF_RED, linewidth=2.2, marker="o",
+                        markersize=5, zorder=4)
+                ax.set_xticks(list(x))
+                ax.set_xticklabels(lbls, rotation=45 if len(lbls) > 10 else 0,
+                                   ha="right" if len(lbls) > 10 else "center",
+                                   fontsize=9, color=TICK_CLR)
+                ax.set_xlabel("Period", fontsize=10, color=TEXT_CLR, labelpad=8)
+                ax.set_ylabel("Record Count", fontsize=10, color=TEXT_CLR, labelpad=8)
+                ax.set_title(title, fontsize=12, fontweight="bold",
+                             color=TEXT_CLR, pad=12)
+                ax.yaxis.set_major_formatter(mticker.FuncFormatter(
+                    lambda v, _: f"{int(v):,}" if v >= 1000 else str(int(v))))
+
+        plt.tight_layout(pad=1.2)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="PNG", dpi=140, bbox_inches="tight",
+                    facecolor=BG, edgecolor="none")
+        plt.close(fig)
+        buf.seek(0)
+
+        return Response(
+            content=buf.read(),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Chart generation failed: {str(e)}")
+
+
+# ── Hexbin interaction plot ───────────────────────────────
+
+@router.get("/profiles/{profile_id}/hexbin/{col_x}/{col_y}")
+def get_hexbin(profile_id: str, col_x: str, col_y: str, gridsize: int = 25):
+    """Return a hexbin density PNG for two numeric columns."""
+    import io
+    import numpy as np
+
+    if profile_id not in profile_store:
+        raise HTTPException(404, "Profile not found")
+    profile = profile_store[profile_id]
+
+    data = profile.numeric_sample_data or {}
+    if col_x not in data or col_y not in data:
+        raise HTTPException(404, "Column sample data not available — re-upload the file")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        x_raw = np.array([v if v is not None else float("nan") for v in data[col_x]], dtype=float)
+        y_raw = np.array([v if v is not None else float("nan") for v in data[col_y]], dtype=float)
+        mask  = ~(np.isnan(x_raw) | np.isnan(y_raw))
+        x, y  = x_raw[mask], y_raw[mask]
+
+        if len(x) < 2:
+            raise HTTPException(400, "Not enough data points for hexbin")
+
+        fig, ax = plt.subplots(figsize=(9, 5.5), facecolor="#FFFFFF")
+        ax.set_facecolor("#FAFAFA")
+        ax.tick_params(colors="#6B7280", labelsize=9)
+        for spine in ax.spines.values():
+            spine.set_color("#E5E7EB")
+
+        hb = ax.hexbin(x, y, gridsize=gridsize, cmap="Blues", mincnt=1,
+                       linewidths=0.3, edgecolors="#CBD5E1")
+        cb = plt.colorbar(hb, ax=ax, shrink=0.85, pad=0.02)
+        cb.set_label("Count", fontsize=10, color="#374151")
+        cb.ax.tick_params(labelsize=8, colors="#6B7280")
+
+        ax.set_xlabel(col_x, fontsize=11, color="#374151", labelpad=8)
+        ax.set_ylabel(col_y, fontsize=11, color="#374151", labelpad=8)
+        ax.set_title(f"Density: {col_x}  ×  {col_y}", fontsize=13,
+                     fontweight="bold", color="#111827", pad=12)
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5, color="#E5E7EB")
+
+        plt.tight_layout(pad=1.5)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="PNG", dpi=140, bbox_inches="tight",
+                    facecolor="#FFFFFF", edgecolor="none")
+        plt.close(fig)
+        buf.seek(0)
+
+        return Response(content=buf.read(), media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=3600"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Hexbin generation failed: {str(e)}")
+
+
+# ── Pearson correlation heatmap ──────────────────────────
+
+@router.get("/profiles/{profile_id}/correlation_heatmap")
+def get_correlation_heatmap(profile_id: str):
+    """Return a Pearson correlation heatmap PNG (seaborn-style)."""
+    import io
+    import numpy as np
+
+    if profile_id not in profile_store:
+        raise HTTPException(404, "Profile not found")
+    profile = profile_store[profile_id]
+
+    corr_dict = profile.correlation_matrix
+    if not corr_dict:
+        raise HTTPException(404, "Correlation matrix not available — re-upload the file")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        col_names = list(corr_dict.keys())
+        n = len(col_names)
+
+        # Build numpy matrix
+        matrix = np.zeros((n, n))
+        for i, ci in enumerate(col_names):
+            for j, cj in enumerate(col_names):
+                v = corr_dict[ci].get(cj)
+                matrix[i, j] = v if v is not None else 0.0
+
+        fig_size = max(7, n * 1.1)
+        fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.85), facecolor="#FFFFFF")
+
+        cmap = plt.cm.RdBu_r
+        im   = ax.imshow(matrix, cmap=cmap, vmin=-1, vmax=1, aspect="auto")
+
+        # Colorbar −1.0 → 1.0
+        cb = plt.colorbar(im, ax=ax, shrink=0.82, pad=0.03)
+        cb.set_ticks([-1.00, -0.75, -0.50, -0.25, 0.00, 0.25, 0.50, 0.75, 1.00])
+        cb.ax.tick_params(labelsize=9)
+
+        # Annotate every cell
+        for i in range(n):
+            for j in range(n):
+                v = matrix[i, j]
+                txt_color = "white" if abs(v) > 0.55 else "black"
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                        fontsize=9, color=txt_color, fontweight="500")
+
+        # White grid lines between cells
+        ax.set_xticks(np.arange(-0.5, n, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, n, 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=1.8)
+        ax.tick_params(which="minor", length=0)
+
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(col_names, rotation=45, ha="right", fontsize=10)
+        ax.set_yticklabels(col_names, fontsize=10)
+        ax.set_title("Pearson Correlation Matrix", fontsize=13,
+                     fontweight="bold", color="#111827", pad=14)
+
+        plt.tight_layout(pad=1.5)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="PNG", dpi=140, bbox_inches="tight",
+                    facecolor="#FFFFFF", edgecolor="none")
+        plt.close(fig)
+        buf.seek(0)
+
+        return Response(content=buf.read(), media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=3600"})
+    except Exception as e:
+        raise HTTPException(500, f"Correlation heatmap generation failed: {str(e)}")
+
+
+# ── Missing-value correlation heatmap ────────────────────
+
+@router.get("/profiles/{profile_id}/missing_heatmap")
+def get_missing_heatmap(profile_id: str):
+    """Return a missing-value correlation heatmap PNG (seaborn style)."""
+    import io
+    import numpy as np
+
+    if profile_id not in profile_store:
+        raise HTTPException(404, "Profile not found")
+    profile = profile_store[profile_id]
+
+    miss_corr = profile.missing_correlation_matrix
+    if not miss_corr:
+        raise HTTPException(404, "Missing correlation matrix not available")
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+
+        col_names = list(miss_corr.keys())
+        n = len(col_names)
+
+        matrix = np.zeros((n, n))
+        for i, ci in enumerate(col_names):
+            for j, cj in enumerate(col_names):
+                v = miss_corr[ci].get(cj)
+                matrix[i, j] = v if v is not None else 0.0
+
+        fig_w = max(7, n * 1.1)
+        fig_h = max(5.5, n * 0.9)
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="#FFFFFF")
+
+        cmap = plt.cm.RdBu_r
+        im   = ax.imshow(matrix, cmap=cmap, vmin=-1, vmax=1, aspect="auto")
+
+        # Colorbar
+        cb = plt.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
+        cb.set_ticks([-1.0, -0.75, -0.50, -0.25, 0.00, 0.25, 0.50, 0.75, 1.00])
+        cb.ax.tick_params(labelsize=9)
+
+        # Cell annotations
+        for i in range(n):
+            for j in range(n):
+                v = matrix[i, j]
+                txt_color = "white" if abs(v) > 0.55 else "black"
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
+                        fontsize=9, color=txt_color, fontweight="500")
+
+        # Grid lines between cells
+        ax.set_xticks(np.arange(-0.5, n, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, n, 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=1.5)
+        ax.tick_params(which="minor", length=0)
+
+        ax.set_xticks(range(n))
+        ax.set_yticks(range(n))
+        ax.set_xticklabels(col_names, rotation=45, ha="right", fontsize=10)
+        ax.set_yticklabels(col_names, fontsize=10)
+        ax.set_title("Missing Value Correlation Heatmap", fontsize=13,
+                     fontweight="bold", color="#111827", pad=14)
+
+        plt.tight_layout(pad=1.5)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="PNG", dpi=140, bbox_inches="tight",
+                    facecolor="#FFFFFF", edgecolor="none")
+        plt.close(fig)
+        buf.seek(0)
+
+        return Response(content=buf.read(), media_type="image/png",
+                        headers={"Cache-Control": "public, max-age=3600"})
+    except Exception as e:
+        raise HTTPException(500, f"Missing heatmap generation failed: {str(e)}")
+
 
 from backend.core.dataforge import generate_schema_from_prompt, generate_all_tables
 from pydantic import BaseModel as PydanticBase
