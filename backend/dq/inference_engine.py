@@ -421,12 +421,17 @@ def infer_pattern_match(col: "ColumnProfile", train: pd.Series, test: pd.Series,
     train_pass = float((train_non_null & train.astype(str).str.match(pattern, na=False)).sum()) / max(train_non_null.sum(), 1)
     if test_pass < _CHECK_THRESHOLD:
         return None
+
+    train_strs = train.dropna().astype(str)
+    matching = train_strs[train_strs.str.match(pattern, na=False)]
+    pattern_example = matching.iloc[0] if len(matching) > 0 else None
+
     return DQCheck(
         profile_id=profile_id,
         column_name=col.column_name,
         check_type=DQCheckType.pattern_match,
         dimension=DQDimension.conformity,
-        parameters={"pattern": pattern},
+        parameters={"pattern": pattern, **({"pattern_example": pattern_example} if pattern_example is not None else {})},
         description=f"{col.column_name} values must match the expected format pattern.",
         confidence=test_pass,
         train_pass_rate=train_pass,

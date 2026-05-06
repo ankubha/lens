@@ -1,6 +1,5 @@
 'use client'
-import { useEffect, useState } from 'react'
-import { useParams } from 'next/navigation'
+import { use, useEffect, useState } from 'react'
 import dynamic from 'next/dynamic'
 import { getProfile, ProfileContract } from '@/lib/api'
 import HealthGauge from '@/components/HealthGauge'
@@ -12,16 +11,15 @@ const UnstructuredProfile  = dynamic(() => import('@/components/UnstructuredProf
 const SemiStructuredProfile = dynamic(() => import('@/components/SemiStructuredProfile'), { ssr: false })
 const DQChecks             = dynamic(() => import('@/components/DQChecks'),             { ssr: false })
 
-export default function ProfilePage() {
-  const { id } = useParams()
+export default function ProfilePage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = use(params)
   const [profile, setProfile]   = useState<ProfileContract | null>(null)
   const [loading, setLoading]   = useState(true)
   const [error, setError]       = useState('')
   const [activeTab, setActiveTab] = useState('overview')
 
   useEffect(() => {
-    if (!id) return
-    getProfile(id as string)
+    getProfile(id)
       .then(data => { setProfile(data); setLoading(false) })
       .catch(e  => { setError(e.message); setLoading(false) })
   }, [id])

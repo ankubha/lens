@@ -10,6 +10,7 @@ from fastapi.responses import Response
 from pathlib import Path
 import shutil
 import uuid
+import json
 
 from backend.models.profile_contract import ProfileContract, DataModality
 from backend.profilers.structured.structured_profiler import profile_structured
@@ -24,14 +25,72 @@ from pydantic import BaseModel as PydanticBase
 
 router = APIRouter(prefix="/api", tags=["profiling"])
 
-UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR   = Path("uploads")
+PROFILES_DIR = Path("profiles")
 UPLOAD_DIR.mkdir(exist_ok=True)
+PROFILES_DIR.mkdir(exist_ok=True)
 
-# In-memory stores (move to Postgres later)
-profile_store: dict[str, ProfileContract] = {}
-file_store: dict[str, Path] = {}
-dq_check_store: dict[str, list[DQCheck]] = {}
-dq_scan_store: dict[str, ScanResult] = {}
+# In-memory stores — backed by PROFILES_DIR for persistence across restarts
+profile_store:   dict[str, ProfileContract]   = {}
+file_store:      dict[str, Path]              = {}
+dq_check_store:  dict[str, list[DQCheck]]     = {}
+dq_scan_store:   dict[str, ScanResult]        = {}
+
+
+# ── Persistence helpers ───────────────────────────────────────
+
+def _save_profile(pid: str) -> None:
+    if pid in profile_store:
+        (PROFILES_DIR / f"{pid}.json").write_text(
+            profile_store[pid].model_dump_json(), encoding="utf-8"
+        )
+
+def _save_checks(pid: str) -> None:
+    if pid in dq_check_store:
+        (PROFILES_DIR / f"{pid}_checks.json").write_text(
+            json.dumps([c.model_dump(mode="json") for c in dq_check_store[pid]]),
+            encoding="utf-8",
+        )
+
+def _save_scan(pid: str) -> None:
+    if pid in dq_scan_store:
+        (PROFILES_DIR / f"{pid}_scan.json").write_text(
+            dq_scan_store[pid].model_dump_json(), encoding="utf-8"
+        )
+
+def _load_all() -> None:
+    """Reload persisted data from disk on server startup."""
+    for f in PROFILES_DIR.glob("*.json"):
+        stem = f.stem
+        if stem.endswith("_checks") or stem.endswith("_scan"):
+            continue
+        pid = stem
+        try:
+            profile_store[pid] = ProfileContract.model_validate_json(f.read_text(encoding="utf-8"))
+            for suffix in STRUCTURED_EXTENSIONS | SEMI_STRUCTURED_EXTENSIONS | UNSTRUCTURED_EXTENSIONS:
+                candidate = UPLOAD_DIR / f"{pid}{suffix}"
+                if candidate.exists():
+                    file_store[pid] = candidate
+                    break
+        except Exception:
+            pass
+
+    for f in PROFILES_DIR.glob("*_checks.json"):
+        pid = f.stem[:-7]
+        try:
+            raw = json.loads(f.read_text(encoding="utf-8"))
+            dq_check_store[pid] = [DQCheck.model_validate(c) for c in raw]
+        except Exception:
+            pass
+
+    for f in PROFILES_DIR.glob("*_scan.json"):
+        pid = f.stem[:-5]
+        try:
+            dq_scan_store[pid] = ScanResult.model_validate_json(f.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+_load_all()
 
 # Supported file types
 STRUCTURED_EXTENSIONS   = {".csv", ".xlsx", ".xls"}
@@ -106,8 +165,9 @@ async def profile_file(file: UploadFile = File(...)):
         else:
             raise HTTPException(status_code=400, detail="Unknown file type.")
 
-        # Store in memory
+        # Store in memory and persist to disk
         profile_store[contract.profile_id] = contract
+        _save_profile(contract.profile_id)
 
         return contract
 
@@ -688,7 +748,7 @@ def get_correlation_heatmap(profile_id: str):
                 v = corr_dict[ci].get(cj)
                 matrix[i, j] = v if v is not None else 0.0
 
-        fig_size = max(7, n * 1.1)
+        fig_size = max(4, min(n * 0.6, 8))
         fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.85), facecolor="#FFFFFF")
 
         cmap = plt.cm.RdBu_r
@@ -722,7 +782,7 @@ def get_correlation_heatmap(profile_id: str):
 
         plt.tight_layout(pad=1.5)
         buf = io.BytesIO()
-        fig.savefig(buf, format="PNG", dpi=140, bbox_inches="tight",
+        fig.savefig(buf, format="PNG", dpi=96, bbox_inches="tight",
                     facecolor="#FFFFFF", edgecolor="none")
         plt.close(fig)
         buf.seek(0)
@@ -764,8 +824,8 @@ def get_missing_heatmap(profile_id: str):
                 v = miss_corr[ci].get(cj)
                 matrix[i, j] = v if v is not None else 0.0
 
-        fig_w = max(7, n * 1.1)
-        fig_h = max(5.5, n * 0.9)
+        fig_w = max(4, min(n * 0.6, 8))
+        fig_h = max(3.5, min(n * 0.5, 7))
         fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor="#FFFFFF")
 
         cmap = plt.cm.RdBu_r
@@ -799,7 +859,7 @@ def get_missing_heatmap(profile_id: str):
 
         plt.tight_layout(pad=1.5)
         buf = io.BytesIO()
-        fig.savefig(buf, format="PNG", dpi=140, bbox_inches="tight",
+        fig.savefig(buf, format="PNG", dpi=96, bbox_inches="tight",
                     facecolor="#FFFFFF", edgecolor="none")
         plt.close(fig)
         buf.seek(0)
@@ -826,6 +886,7 @@ def infer_dq_checks(profile_id: str):
     except Exception as e:
         raise HTTPException(500, f"Inference failed: {str(e)}")
     dq_check_store[profile_id] = checks
+    _save_checks(profile_id)
     return {
         "profile_id": profile_id,
         "total_checks": len(checks),
@@ -861,6 +922,7 @@ def update_check_status(profile_id: str, check_id: str, body: CheckStatusUpdate)
     for c in checks:
         if c.check_id == check_id:
             c.status = body.status
+            _save_checks(profile_id)
             return c.model_dump()
     raise HTTPException(404, f"Check '{check_id}' not found.")
 
@@ -882,6 +944,7 @@ def bulk_update_checks(profile_id: str, body: BulkStatusUpdate):
         if not ids or c.check_id in ids:
             c.status = body.status
             updated += 1
+    _save_checks(profile_id)
     return {"updated": updated, "status": body.status}
 
 
@@ -909,6 +972,8 @@ def scan_profile(profile_id: str):
             c.fail_count = updated.fail_count
             c.fail_pct   = updated.fail_pct
     dq_scan_store[profile_id] = result
+    _save_scan(profile_id)
+    _save_checks(profile_id)   # scan merges pass/fail counts back into checks
     return result.model_dump()
 
 

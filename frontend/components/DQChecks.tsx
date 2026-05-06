@@ -84,27 +84,39 @@ function ConfBar({ value }: { value: number }) {
 // ── Parameter pills ────────────────────────────────────────
 function ParamPills({ params, checkType }: { params: Record<string, any>; checkType: DQCheckType }) {
   const skip = new Set(['ks_statistic', 'p_value', 'distribution', 'q1', 'q3', 'iqr', 'mean', 'std',
-    'loc', 'scale', 's', 'null_threshold_pct', 'min_unique_pct'])
+    'loc', 'scale', 's', 'null_threshold_pct', 'min_unique_pct', 'pattern_example'])
   const entries = Object.entries(params).filter(([k]) => !skip.has(k))
   if (entries.length === 0) return null
   return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 8 }}>
-      {entries.map(([k, v]) => {
-        const display = Array.isArray(v)
-          ? `${k}: [${v.slice(0, 3).join(', ')}${v.length > 3 ? ', …' : ''}]`
-          : typeof v === 'number'
-          ? `${k}: ${Number.isInteger(v) ? v : v.toFixed(4)}`
-          : `${k}: ${v}`
-        return (
-          <span key={k} style={{
-            fontSize: 10, fontFamily: 'monospace',
+    <div style={{ marginTop: 8 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+        {entries.map(([k, v]) => {
+          const display = Array.isArray(v)
+            ? `${k}: [${v.slice(0, 3).join(', ')}${v.length > 3 ? ', …' : ''}]`
+            : typeof v === 'number'
+            ? `${k}: ${Number.isInteger(v) ? v : v.toFixed(4)}`
+            : `${k}: ${v}`
+          return (
+            <span key={k} style={{
+              fontSize: 10, fontFamily: 'monospace',
+              background: 'var(--surface-2)', border: '0.5px solid var(--border-1)',
+              borderRadius: 4, padding: '2px 6px', color: 'var(--ink-2)',
+            }}>
+              {display}
+            </span>
+          )
+        })}
+      </div>
+      {checkType === 'pattern_match' && params.pattern_example != null && (
+        <div style={{ marginTop: 5, fontSize: 11, color: 'var(--ink-3)' }}>
+          e.g.{' '}
+          <code style={{
+            fontSize: 11, fontFamily: 'monospace',
             background: 'var(--surface-2)', border: '0.5px solid var(--border-1)',
-            borderRadius: 4, padding: '2px 6px', color: 'var(--ink-2)',
-          }}>
-            {display}
-          </span>
-        )
-      })}
+            borderRadius: 4, padding: '1px 5px', color: 'var(--ink)',
+          }}>{params.pattern_example}</code>
+        </div>
+      )}
     </div>
   )
 }
@@ -236,8 +248,13 @@ function AnomalyRow({ anomaly }: { anomaly: DQAnomaly }) {
             color: isRecord ? '#2563EB' : '#B45309',
           }}>{anomaly.anomaly_type}</span>
         </td>
-        <td style={{ padding: '10px 12px', fontSize: 11, color: 'var(--ink-3)' }}>
-          {anomaly.check_type.replace(/_/g, ' ')}
+        <td style={{ padding: '10px 12px' }}>
+          <span style={{
+            fontSize: 11, fontWeight: 600, padding: '2px 8px',
+            borderRadius: 6, fontFamily: 'monospace',
+            background: 'var(--surface-2)', border: '0.5px solid var(--border-1)',
+            color: 'var(--ink)', whiteSpace: 'nowrap',
+          }}>{anomaly.check_type.replace(/_/g, ' ')}</span>
         </td>
         <td style={{ padding: '10px 12px', fontSize: 12, color: 'var(--ink-2)' }}>
           {anomaly.description}
@@ -286,9 +303,11 @@ export default function DQChecks({ profileId }: Props) {
   const [filterDim,    setFilterDim]    = useState<string>('all')
   const [filterStatus, setFilterStatus] = useState<string>('all')
   const [filterType,   setFilterType]   = useState<string>('all')
-  const [filterSev,    setFilterSev]    = useState<string>('all')
-  const [filterCol,    setFilterCol]    = useState('')
-  const [filterAType,  setFilterAType]  = useState<string>('all')
+  const [filterSev,        setFilterSev]        = useState<string>('all')
+  const [filterCol,        setFilterCol]        = useState('')
+  const [filterAType,      setFilterAType]      = useState<string>('all')
+  const [filterACheckType, setFilterACheckType] = useState<string>('all')
+  const [showChecks,       setShowChecks]       = useState(true)
 
   // Restore state on mount
   useEffect(() => {
@@ -304,6 +323,7 @@ export default function DQChecks({ profileId }: Props) {
           setChecks(checksData.checks)
           setScan(scanData)
           setPhase(scanData ? 'results' : 'checks')
+          if (scanData) setShowChecks(false)
         }
       } catch {
         // nothing — stays idle
@@ -346,6 +366,7 @@ export default function DQChecks({ profileId }: Props) {
     try {
       const result = await runScan(profileId)
       setScan(result)
+      setShowChecks(false)
       // Merge scan counts back into checks
       const resultMap = Object.fromEntries(result.check_results.map(c => [c.check_id, c]))
       setChecks(prev => prev.map(c => resultMap[c.check_id]
@@ -384,12 +405,13 @@ export default function DQChecks({ profileId }: Props) {
   const filteredAnomalies = useMemo(() => {
     if (!scanResult) return []
     return scanResult.anomalies.filter(a => {
-      if (filterSev   !== 'all' && a.severity     !== filterSev)   return false
-      if (filterAType !== 'all' && a.anomaly_type !== filterAType) return false
+      if (filterSev        !== 'all' && a.severity     !== filterSev)        return false
+      if (filterAType      !== 'all' && a.anomaly_type !== filterAType)      return false
+      if (filterACheckType !== 'all' && a.check_type   !== filterACheckType) return false
       if (filterCol   && !a.column_name.toLowerCase().includes(filterCol.toLowerCase())) return false
       return true
     })
-  }, [scanResult, filterSev, filterAType, filterCol])
+  }, [scanResult, filterSev, filterAType, filterACheckType, filterCol])
 
   // ── Shared styles ────────────────────────────────────────
   const card: React.CSSProperties = {
@@ -545,56 +567,84 @@ export default function DQChecks({ profileId }: Props) {
         </div>
       )}
 
-      {/* ── Check filters ────────────────────────────────────── */}
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-        <span style={{ fontSize: 11, color: 'var(--ink-3)', fontWeight: 500 }}>Filter:</span>
-        <select value={filterDim}    onChange={e => setFilterDim(e.target.value)}    style={selectStyle}>
-          <option value="all">All Dimensions</option>
-          {dimensions.map(d => <option key={d} value={d}>{d}</option>)}
-        </select>
-        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={selectStyle}>
-          <option value="all">All Statuses</option>
-          <option value="pending">Pending</option>
-          <option value="authorized">Authorized</option>
-          <option value="rejected">Rejected</option>
-        </select>
-        <select value={filterType}   onChange={e => setFilterType(e.target.value)}   style={selectStyle}>
-          <option value="all">All Check Types</option>
-          {Array.from(new Set(checks.map(c => c.check_type))).map(t => (
-            <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>
-          ))}
-        </select>
-      </div>
+      {/* ── Check section (collapsible in results phase) ─────── */}
+      <div style={card}>
+        <button
+          onClick={() => setShowChecks(s => !s)}
+          style={{
+            width: '100%', display: 'flex', alignItems: 'center', gap: 10,
+            padding: '13px 18px', background: 'var(--surface-2)',
+            border: 'none', borderBottom: showChecks ? '0.5px solid var(--border-1)' : 'none',
+            cursor: 'pointer', textAlign: 'left',
+          }}
+        >
+          <span style={{
+            fontSize: 13, display: 'inline-block', transition: 'transform 0.2s',
+            transform: showChecks ? 'rotate(90deg)' : 'none', color: 'var(--ink-3)',
+          }}>▶</span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', flex: 1 }}>
+            Rules ({checks.length})
+          </span>
+          <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+            {authorizedCount} authorized · {checks.filter(c => c.status === 'rejected').length} rejected
+          </span>
+        </button>
 
-      {/* ── Check groups by dimension ─────────────────────────── */}
-      {dimensions.filter(d => groupedByDim[d]?.length).map(dim => {
-        const dim_checks = groupedByDim[dim]
-        const dimColors = DIM_COLORS[dim]
-        return (
-          <div key={dim} style={card}>
-            <div style={{
-              padding: '12px 18px', borderBottom: '0.5px solid var(--border-1)',
-              background: 'var(--surface-2)',
-              display: 'flex', alignItems: 'center', gap: 10,
-            }}>
-              <span style={{
-                fontSize: 12, fontWeight: 600, padding: '3px 10px',
-                borderRadius: 10, background: dimColors.bg, color: dimColors.text,
-                textTransform: 'capitalize',
-              }}>{dim}</span>
-              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>
-                {dim_checks.length} rule{dim_checks.length !== 1 ? 's' : ''} ·{' '}
-                {dim_checks.filter(c => c.status === 'authorized').length} authorized
-              </span>
+        {showChecks && (
+          <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {/* Filters */}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <span style={{ fontSize: 11, color: 'var(--ink-3)', fontWeight: 500 }}>Filter:</span>
+              <select value={filterDim}    onChange={e => setFilterDim(e.target.value)}    style={selectStyle}>
+                <option value="all">All Dimensions</option>
+                {dimensions.map(d => <option key={d} value={d}>{d}</option>)}
+              </select>
+              <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={selectStyle}>
+                <option value="all">All Statuses</option>
+                <option value="pending">Pending</option>
+                <option value="authorized">Authorized</option>
+                <option value="rejected">Rejected</option>
+              </select>
+              <select value={filterType}   onChange={e => setFilterType(e.target.value)}   style={selectStyle}>
+                <option value="all">All Check Types</option>
+                {Array.from(new Set(checks.map(c => c.check_type))).map(t => (
+                  <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>
+                ))}
+              </select>
             </div>
-            <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {dim_checks.map(c => (
-                <CheckCard key={c.check_id} check={c} onStatusChange={handleStatusChange} />
-              ))}
-            </div>
+
+            {/* Dimension groups */}
+            {dimensions.filter(d => groupedByDim[d]?.length).map(dim => {
+              const dim_checks = groupedByDim[dim]
+              const dimColors = DIM_COLORS[dim]
+              return (
+                <div key={dim} style={{ border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-md)', overflow: 'hidden' }}>
+                  <div style={{
+                    padding: '10px 14px', borderBottom: '0.5px solid var(--border-1)',
+                    background: 'var(--surface-2)',
+                    display: 'flex', alignItems: 'center', gap: 10,
+                  }}>
+                    <span style={{
+                      fontSize: 12, fontWeight: 600, padding: '3px 10px',
+                      borderRadius: 10, background: dimColors.bg, color: dimColors.text,
+                      textTransform: 'capitalize',
+                    }}>{dim}</span>
+                    <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+                      {dim_checks.length} rule{dim_checks.length !== 1 ? 's' : ''} ·{' '}
+                      {dim_checks.filter(c => c.status === 'authorized').length} authorized
+                    </span>
+                  </div>
+                  <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 10, background: 'var(--surface)' }}>
+                    {dim_checks.map(c => (
+                      <CheckCard key={c.check_id} check={c} onStatusChange={handleStatusChange} />
+                    ))}
+                  </div>
+                </div>
+              )
+            })}
           </div>
-        )
-      })}
+        )}
+      </div>
 
       {/* ── Anomaly table (results phase only) ────────────────── */}
       {phase === 'results' && scanResult && scanResult.total_anomalies > 0 && (
@@ -611,6 +661,12 @@ export default function DQChecks({ profileId }: Props) {
               <option value="all">Shape + Record</option>
               <option value="shape">Shape only</option>
               <option value="record">Record only</option>
+            </select>
+            <select value={filterACheckType} onChange={e => setFilterACheckType(e.target.value)} style={selectStyle}>
+              <option value="all">All Check Types</option>
+              {Array.from(new Set(scanResult.anomalies.map(a => a.check_type))).map(t => (
+                <option key={t} value={t}>{t.replace(/_/g, ' ')}</option>
+              ))}
             </select>
             <select value={filterSev} onChange={e => setFilterSev(e.target.value)} style={selectStyle}>
               <option value="all">All Severities</option>

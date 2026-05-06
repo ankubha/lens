@@ -71,7 +71,7 @@ export default function HomePage() {
     <div>
 
       {/* ── PROFILER TAB ── */}
-      {activeTab === 'profiler' && (
+      <div style={{ display: activeTab === 'profiler' ? 'block' : 'none' }}>
         <div style={{ maxWidth: 900, margin: '0 auto', padding: '60px 24px' }}>
 
           <div style={{ textAlign: 'center', marginBottom: 56 }} className="animate-fade-up">
@@ -205,10 +205,12 @@ export default function HomePage() {
           </div>
 
         </div>
-      )}
+      </div>
 
       {/* ── DATAFORGE TAB ── */}
-      {activeTab === 'dataforge' && <DataForge />}
+      <div style={{ display: activeTab === 'dataforge' ? 'block' : 'none' }}>
+        <DataForge />
+      </div>
 
       <LensBot profile={null} />
     </div>
