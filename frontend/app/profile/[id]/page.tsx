@@ -10,6 +10,7 @@ import LensBot from '@/components/LensBot'
 const StructuredProfile    = dynamic(() => import('@/components/StructuredProfile'),    { ssr: false })
 const UnstructuredProfile  = dynamic(() => import('@/components/UnstructuredProfile'),  { ssr: false })
 const SemiStructuredProfile = dynamic(() => import('@/components/SemiStructuredProfile'), { ssr: false })
+const DQChecks             = dynamic(() => import('@/components/DQChecks'),             { ssr: false })
 
 export default function ProfilePage() {
   const { id } = useParams()
@@ -63,7 +64,7 @@ export default function ProfilePage() {
 
   // ── Tabs per modality ────────────────────────────────
   const tabs = isStructured
-    ? ['overview', 'sample', 'variables', 'missing', 'correlations', 'interactions', 'dictionary', 'duplicates', 'intelligence']
+    ? ['overview', 'sample', 'variables', 'missing', 'correlations', 'interactions', 'dictionary', 'duplicates', 'intelligence', 'dq_checks']
     : isSemiStructured
     ? ['overview', 'sample', 'schema', 'variables', 'missing', 'heatmap', 'dictionary']
     : ['overview', 'elements', 'summary', 'obligations', 'dictionary', 'regulatory']
@@ -80,6 +81,7 @@ export default function ProfilePage() {
     dictionary:   'Data Dictionary',
     duplicates:   'Duplicate Rows',
     intelligence: 'AI Intelligence',
+    dq_checks:    'DQ Checks',
     schema:       'Schema Analysis',
     elements:     'Business Elements',
     summary:      'Summary',
@@ -269,7 +271,10 @@ export default function ProfilePage() {
 
       {/* ── Tab content ───────────────────────────────────── */}
       <div className="animate-fade-in">
-        {isStructured && (
+        {isStructured && activeTab === 'dq_checks' && (
+          <DQChecks profileId={profile.profile_id} />
+        )}
+        {isStructured && activeTab !== 'dq_checks' && (
           <StructuredProfile profile={profile} activeTab={activeTab} />
         )}
         {isSemiStructured && (

@@ -192,3 +192,110 @@ export interface ProfileSummary {
   health_score?: number
   created_at: string
 }
+
+// ── DQ Engine types ───────────────────────────────────────
+
+export type DQCheckType =
+  | 'not_null' | 'min_max_range' | 'iqr_outlier' | 'z_score_outlier'
+  | 'non_negative' | 'categorical_set' | 'string_length' | 'pattern_match'
+  | 'uniqueness' | 'no_future_date' | 'date_range' | 'distribution_fit'
+
+export type DQCheckStatus = 'pending' | 'authorized' | 'rejected'
+
+export type DQDimension =
+  | 'completeness' | 'validity' | 'uniqueness' | 'conformity' | 'accuracy' | 'consistency'
+
+export interface DQCheck {
+  check_id: string
+  profile_id: string
+  column_name: string
+  check_type: DQCheckType
+  status: DQCheckStatus
+  parameters: Record<string, any>
+  description: string
+  dimension: DQDimension
+  confidence: number
+  train_pass_rate: number
+  test_pass_rate: number
+  sample_size: number
+  created_at: string
+  pass_count?: number
+  fail_count?: number
+  fail_pct?: number
+}
+
+export interface DQAnomaly {
+  anomaly_id: string
+  check_id: string
+  column_name: string
+  check_type: DQCheckType
+  anomaly_type: 'record' | 'shape'
+  row_index?: number
+  row_data?: Record<string, any>
+  offending_value?: any
+  description: string
+  severity: 'low' | 'medium' | 'high'
+}
+
+export interface ScanResult {
+  scan_id: string
+  profile_id: string
+  scanned_at: string
+  total_rows: number
+  total_checks: number
+  checks_passed: number
+  checks_failed: number
+  total_anomalies: number
+  record_anomalies: number
+  shape_anomalies: number
+  dq_score: number
+  anomalies: DQAnomaly[]
+  check_results: DQCheck[]
+}
+
+// ── DQ API functions ──────────────────────────────────────
+
+export async function inferDQChecks(profileId: string): Promise<{ profile_id: string; total_checks: number; checks: DQCheck[] }> {
+  const res = await fetch(`${API_BASE}/api/profiles/${profileId}/infer-checks`, { method: 'POST' })
+  if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Inference failed') }
+  return res.json()
+}
+
+export async function getDQChecks(profileId: string): Promise<{ total: number; pending: number; authorized: number; rejected: number; checks: DQCheck[] }> {
+  const res = await fetch(`${API_BASE}/api/profiles/${profileId}/checks`)
+  if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Failed to fetch checks') }
+  return res.json()
+}
+
+export async function updateCheckStatus(profileId: string, checkId: string, status: DQCheckStatus): Promise<DQCheck> {
+  const res = await fetch(`${API_BASE}/api/profiles/${profileId}/checks/${checkId}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status }),
+  })
+  if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Update failed') }
+  return res.json()
+}
+
+export async function bulkUpdateChecks(profileId: string, status: DQCheckStatus, checkIds: string[] = []): Promise<{ updated: number; status: string }> {
+  const res = await fetch(`${API_BASE}/api/profiles/${profileId}/checks`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status, check_ids: checkIds }),
+  })
+  if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Bulk update failed') }
+  return res.json()
+}
+
+export async function runScan(profileId: string): Promise<ScanResult> {
+  const res = await fetch(`${API_BASE}/api/profiles/${profileId}/scan`, { method: 'POST' })
+  if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Scan failed') }
+  return res.json()
+}
+
+export async function getScanResult(profileId: string): Promise<ScanResult | null> {
+  const res = await fetch(`${API_BASE}/api/profiles/${profileId}/scan-result`)
+  if (res.status === 404) return null
+  if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Failed to fetch scan result') }
+  return res.json()
+}

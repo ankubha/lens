@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from backend.dq.scanner import run_scan; print\\('scanner OK'\\)\")"
+    ]
+  }
+}

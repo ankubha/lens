@@ -17,6 +17,9 @@ from backend.profilers.unstructured.unstructured_profiler import profile_unstruc
 from backend.profilers.semi_structured.semi_structured_profiler import profile_semi_structured
 from backend.core.fry14_validator import validate_against_schedule_h
 from backend.agent.lensbot import ask_lensbot
+from backend.dq.models import DQCheck, DQCheckStatus, ScanResult
+from backend.dq.inference_engine import infer_checks
+from backend.dq.scanner import run_scan
 from pydantic import BaseModel as PydanticBase
 
 router = APIRouter(prefix="/api", tags=["profiling"])
@@ -24,8 +27,11 @@ router = APIRouter(prefix="/api", tags=["profiling"])
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# In-memory profile store (we'll move to Postgres later)
+# In-memory stores (move to Postgres later)
 profile_store: dict[str, ProfileContract] = {}
+file_store: dict[str, Path] = {}
+dq_check_store: dict[str, list[DQCheck]] = {}
+dq_scan_store: dict[str, ScanResult] = {}
 
 # Supported file types
 STRUCTURED_EXTENSIONS   = {".csv", ".xlsx", ".xls"}
@@ -84,6 +90,10 @@ async def profile_file(file: UploadFile = File(...)):
         if modality == "structured":
             contract = profile_structured(temp_path)
             contract.filename = file.filename
+            # Persist file so DQ engine can read it later
+            persistent_path = UPLOAD_DIR / f"{contract.profile_id}{suffix}"
+            shutil.copy2(temp_path, persistent_path)
+            file_store[contract.profile_id] = persistent_path
 
         elif modality == "unstructured":
             contract = profile_unstructured(temp_path)
@@ -799,6 +809,118 @@ def get_missing_heatmap(profile_id: str):
     except Exception as e:
         raise HTTPException(500, f"Missing heatmap generation failed: {str(e)}")
 
+
+# ── DQ Engine ─────────────────────────────────────────────
+
+@router.post("/profiles/{profile_id}/infer-checks")
+def infer_dq_checks(profile_id: str):
+    """Run the statistical inference engine to propose DQ checks."""
+    if profile_id not in profile_store:
+        raise HTTPException(404, f"Profile '{profile_id}' not found.")
+    if profile_id not in file_store:
+        raise HTTPException(404, "Source file not available. Re-upload to enable DQ checks.")
+    profile = profile_store[profile_id]
+    file_path = file_store[profile_id]
+    try:
+        checks = infer_checks(profile, file_path)
+    except Exception as e:
+        raise HTTPException(500, f"Inference failed: {str(e)}")
+    dq_check_store[profile_id] = checks
+    return {
+        "profile_id": profile_id,
+        "total_checks": len(checks),
+        "checks": [c.model_dump() for c in checks],
+    }
+
+
+@router.get("/profiles/{profile_id}/checks")
+def get_dq_checks(profile_id: str):
+    """Return all inferred checks for a profile."""
+    if profile_id not in profile_store:
+        raise HTTPException(404, f"Profile '{profile_id}' not found.")
+    checks = dq_check_store.get(profile_id, [])
+    return {
+        "total":      len(checks),
+        "pending":    sum(1 for c in checks if c.status == DQCheckStatus.pending),
+        "authorized": sum(1 for c in checks if c.status == DQCheckStatus.authorized),
+        "rejected":   sum(1 for c in checks if c.status == DQCheckStatus.rejected),
+        "checks":     [c.model_dump() for c in checks],
+    }
+
+
+class CheckStatusUpdate(PydanticBase):
+    status: DQCheckStatus
+
+
+@router.patch("/profiles/{profile_id}/checks/{check_id}")
+def update_check_status(profile_id: str, check_id: str, body: CheckStatusUpdate):
+    """Update the status of a single check."""
+    checks = dq_check_store.get(profile_id)
+    if not checks:
+        raise HTTPException(404, "No checks found for this profile.")
+    for c in checks:
+        if c.check_id == check_id:
+            c.status = body.status
+            return c.model_dump()
+    raise HTTPException(404, f"Check '{check_id}' not found.")
+
+
+class BulkStatusUpdate(PydanticBase):
+    status: DQCheckStatus
+    check_ids: list[str] = []
+
+
+@router.patch("/profiles/{profile_id}/checks")
+def bulk_update_checks(profile_id: str, body: BulkStatusUpdate):
+    """Bulk-update status. Empty check_ids applies to all."""
+    checks = dq_check_store.get(profile_id)
+    if not checks:
+        raise HTTPException(404, "No checks found for this profile.")
+    ids = set(body.check_ids)
+    updated = 0
+    for c in checks:
+        if not ids or c.check_id in ids:
+            c.status = body.status
+            updated += 1
+    return {"updated": updated, "status": body.status}
+
+
+@router.post("/profiles/{profile_id}/scan")
+def scan_profile(profile_id: str):
+    """Execute authorized DQ checks and detect anomalies."""
+    if profile_id not in profile_store:
+        raise HTTPException(404, f"Profile '{profile_id}' not found.")
+    if profile_id not in file_store:
+        raise HTTPException(404, "Source file not available.")
+    checks = dq_check_store.get(profile_id, [])
+    authorized = [c for c in checks if c.status == DQCheckStatus.authorized]
+    if not authorized:
+        raise HTTPException(400, "No authorized checks to scan. Authorize at least one check first.")
+    try:
+        result = run_scan(file_store[profile_id], checks, profile_id)
+    except Exception as e:
+        raise HTTPException(500, f"Scan failed: {str(e)}")
+    # Write scan pass/fail counts back into the check store
+    result_map = {c.check_id: c for c in result.check_results}
+    for c in checks:
+        if c.check_id in result_map:
+            updated = result_map[c.check_id]
+            c.pass_count = updated.pass_count
+            c.fail_count = updated.fail_count
+            c.fail_pct   = updated.fail_pct
+    dq_scan_store[profile_id] = result
+    return result.model_dump()
+
+
+@router.get("/profiles/{profile_id}/scan-result")
+def get_scan_result(profile_id: str):
+    """Return the latest scan result for a profile."""
+    if profile_id not in dq_scan_store:
+        raise HTTPException(404, "No scan result found. Run a scan first.")
+    return dq_scan_store[profile_id].model_dump()
+
+
+# ── DataForge ─────────────────────────────────────────────
 
 from backend.core.dataforge import generate_schema_from_prompt, generate_all_tables
 from pydantic import BaseModel as PydanticBase
