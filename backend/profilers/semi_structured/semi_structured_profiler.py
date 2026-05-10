@@ -2,8 +2,7 @@
 Lens — Semi-Structured Profiler
 ================================
 Handles JSON and XML files.
-Flattens nested structure → profiles like structured data.
-Works for single documents and batches.
+Flattens nested structure → profiles at full parity with the structured profiler.
 """
 
 from __future__ import annotations
@@ -33,6 +32,8 @@ from backend.profilers.structured.structured_profiler import (
     profile_column,
     compute_health_score,
     generate_column_definitions,
+    generate_cross_column_intelligence,
+    detect_drift,
 )
 
 load_dotenv()
@@ -97,10 +98,8 @@ def load_as_dataframe(path: Path) -> tuple[pd.DataFrame, DocumentType]:
             raw = _json.load(f)
 
         if isinstance(raw, list):
-            # Array of objects — each object becomes a row
             rows = [flatten_json(item) for item in raw]
         elif isinstance(raw, dict):
-            # Single object — flatten and make one row
             rows = [flatten_json(raw)]
         else:
             rows = [{"value": raw}]
@@ -112,16 +111,14 @@ def load_as_dataframe(path: Path) -> tuple[pd.DataFrame, DocumentType]:
         tree = ET.parse(path)
         root = tree.getroot()
 
-        # Try to detect if root contains repeated child elements (batch)
         child_tags = [c.tag.split('}')[-1] if '}' in c.tag else c.tag for c in root]
         if len(child_tags) > 1 and len(set(child_tags)) == 1:
-            # Repeated children — each is a row
             rows = [flatten_xml(child) for child in root]
         else:
             rows = [flatten_xml(root)]
 
         df = pd.DataFrame(rows)
-        return df, DocumentType.JSON  # Use JSON type for now, XML handled same way
+        return df, DocumentType.JSON
 
     else:
         raise ValueError(f"Unsupported semi-structured type: {suffix}")
@@ -139,10 +136,10 @@ def analyse_schema(df: pd.DataFrame) -> dict:
     for col in df.columns:
         present = df[col].notna().sum()
         schema[col] = {
-            "path":       col,
-            "present":    int(present),
-            "missing":    int(total_records - present),
-            "coverage":   round((present / total_records) * 100, 1) if total_records > 0 else 0,
+            "path":        col,
+            "present":     int(present),
+            "missing":     int(total_records - present),
+            "coverage":    round((present / total_records) * 100, 1) if total_records > 0 else 0,
             "is_required": present == total_records,
             "inferred_type": str(df[col].dtype),
             "sample_values": [str(v) for v in df[col].dropna().head(3).tolist()],
@@ -151,51 +148,17 @@ def analyse_schema(df: pd.DataFrame) -> dict:
     return schema
 
 
-def generate_schema_summary(schema: dict, path: Path) -> str:
-    """LLM-generated summary of the schema structure."""
-    try:
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-        fields = [
-            f"{k} (coverage: {v['coverage']}%, type: {v['inferred_type']}, sample: {v['sample_values'][:2]})"
-            for k, v in list(schema.items())[:30]
-        ]
-
-        prompt = f"""You are a data architect analysing a semi-structured data file.
-
-File: {path.name}
-Fields detected ({len(schema)} total):
-{chr(10).join(fields)}
-
-Write a professional 3-4 sentence summary of:
-1. What this file appears to represent
-2. Its structure and key fields
-3. Any notable patterns, missing data, or data quality observations
-4. Recommended use cases for this data
-
-Be concise and technical."""
-
-        response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=512,
-        )
-        return response.choices[0].message.content.strip()
-
-    except Exception as e:
-        print(f"  [Lens] Schema summary failed: {e}")
-        return ""
-
-
 # ─────────────────────────────────────────────
 # MAIN PROFILER
 # ─────────────────────────────────────────────
 
-def profile_semi_structured(file_path: str | Path) -> ProfileContract:
+def profile_semi_structured(
+    file_path: str | Path,
+    prior_profile: ProfileContract | None = None,
+) -> ProfileContract:
     """
     Main entry point. Takes a JSON or XML file.
-    Returns a fully populated ProfileContract.
+    Returns a fully populated ProfileContract at full parity with the structured profiler.
     """
     path = Path(file_path)
     print(f"  [Lens] Loading {path.suffix.upper()} file...")
@@ -205,7 +168,7 @@ def profile_semi_structured(file_path: str | Path) -> ProfileContract:
     # Clean column names
     df.columns = [re.sub(r'[^\w\.]', '_', str(c)) for c in df.columns]
 
-    # Try to infer types
+    # Infer types
     for col in df.columns:
         try:
             df[col] = pd.to_numeric(df[col])
@@ -230,13 +193,16 @@ def profile_semi_structured(file_path: str | Path) -> ProfileContract:
     # ── Health score ─────────────────────────
     health, breakdown = compute_health_score(df, columns)
 
-    # ── Schema analysis ───────────────────────
+    # ── Drift detection ──────────────────────
+    drift_alerts = []
+    prior_id = None
+    if prior_profile and prior_profile.columns:
+        drift_alerts = detect_drift(columns, prior_profile.columns)
+        prior_id = prior_profile.profile_id
+
+    # ── Schema analysis (for schema tab) ─────
     print("  [Lens] Analysing schema...")
     schema = analyse_schema(df)
-
-    # ── Schema summary via LLM ────────────────
-    print("  [Lens] Generating schema summary...")
-    schema_summary = generate_schema_summary(schema, path)
 
     # ── Sample rows ──────────────────────────
     def rows_to_dict(df_slice: pd.DataFrame) -> list[dict]:
@@ -248,19 +214,85 @@ def profile_semi_structured(file_path: str | Path) -> ProfileContract:
 
     sample_head = rows_to_dict(df.head(10))
     sample_tail = rows_to_dict(df.tail(10))
+
+    # ── Duplicate rows ────────────────────────
     dup_mask = df.duplicated(keep=False)
     duplicate_rows = rows_to_dict(df[dup_mask].head(20)) if dup_mask.any() else []
 
-    # ── Schema fields as ExtractedFacts ──────
+    # ── Duplicate groups with frequency counts ─
+    duplicate_row_groups: list[dict] = []
+    if dup_mask.any():
+        try:
+            str_df = df.astype(str)
+            grp = (
+                str_df[dup_mask]
+                .groupby(list(str_df.columns), as_index=False)
+                .size()
+                .rename(columns={"size": "__count__"})
+                .sort_values("__count__", ascending=False)
+                .head(50)
+            )
+            duplicate_row_groups = grp.to_dict(orient="records")
+        except Exception:
+            duplicate_row_groups = []
+
+    # ── Pearson correlation matrix (numeric cols) ─
+    correlation_matrix: dict | None = None
+    numeric_col_names = [c.column_name for c in columns if c.var_type == "Numeric"]
+    if len(numeric_col_names) >= 2:
+        try:
+            numeric_df = df[numeric_col_names].apply(pd.to_numeric, errors="coerce")
+            corr = numeric_df.corr(method="pearson").round(4)
+            correlation_matrix = {
+                col: {other: (None if pd.isna(v) else float(v)) for other, v in row.items()}
+                for col, row in corr.to_dict().items()
+            }
+        except Exception:
+            pass
+
+    # ── Numeric sample data (for hexbin / interactions tab) ─
+    numeric_sample_data: dict | None = None
+    if numeric_col_names:
+        try:
+            def _safe_float(v):
+                return None if pd.isna(v) else float(v)
+            numeric_sample_data = {
+                col: [_safe_float(v) for v in df[col].head(5000)]
+                for col in numeric_col_names
+            }
+        except Exception:
+            pass
+
+    # ── Missing-value correlation matrix ─────
+    missing_correlation_matrix: dict | None = None
+    try:
+        miss_ind = df.isna().astype(float)
+        miss_corr = miss_ind.corr(method="pearson").round(3)
+        missing_correlation_matrix = {
+            col: {other: (None if pd.isna(v) else float(v)) for other, v in row.items()}
+            for col, row in miss_corr.to_dict().items()
+        }
+    except Exception:
+        pass
+
+    # ── Cross-column intelligence ─────────────
+    print("  [Lens] Generating cross-column intelligence...")
+    cross_column_intelligence = generate_cross_column_intelligence(df, columns)
+
+    # ── Schema fields as ExtractedFacts (for schema tab) ──
     schema_facts = []
     for field_path, info in list(schema.items())[:40]:
         schema_facts.append(ExtractedFact(
             field_name=field_path,
-            business_definition=definitions.get(field_path.replace('.', '_').replace('[', '_').replace(']', '')),
+            business_definition=definitions.get(
+                field_path.replace('.', '_').replace('[', '_').replace(']', '')
+            ),
             value=f"{info['coverage']}% present ({info['present']}/{len(df)} records)",
             provenance=ProvenanceSpan(
                 confidence_score=info['coverage'] / 100,
-                confidence_level=ConfidenceLevel.HIGH if info['coverage'] > 80 else ConfidenceLevel.MEDIUM,
+                confidence_level=(
+                    ConfidenceLevel.HIGH if info['coverage'] > 80 else ConfidenceLevel.MEDIUM
+                ),
             ),
             sensitivity=SensitivityTier.INTERNAL,
         ))
@@ -287,14 +319,20 @@ def profile_semi_structured(file_path: str | Path) -> ProfileContract:
         column_count=len(df.columns),
         duplicate_row_count=int(df.duplicated().sum()),
         duplicate_rows=duplicate_rows,
+        duplicate_row_groups=duplicate_row_groups,
         sample_head=sample_head,
         sample_tail=sample_tail,
         columns=columns,
+        correlation_matrix=correlation_matrix,
+        missing_correlation_matrix=missing_correlation_matrix,
+        numeric_sample_data=numeric_sample_data,
         health_score=health,
         health_breakdown=breakdown,
-        critical_business_elements=schema_facts,
+        drift_alerts=drift_alerts,
+        prior_profile_id=prior_id,
+        critical_data_elements=schema_facts,
         additional_findings=[],
-        raw_llm_narrative=schema_summary,
+        raw_llm_narrative=cross_column_intelligence,
         audit_log=audit_log,
         llm_used="llama-4-scout-17b",
         deterministic_only=False,

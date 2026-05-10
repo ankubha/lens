@@ -1,6 +1,6 @@
 'use client'
 import { useState } from 'react'
-import { ProfileContract, ExtractedFact } from '@/lib/api'
+import { ProfileContract, ExtractedFact, DiscoveredField } from '@/lib/api'
 import Badge from './Badge'
 
 interface Props {
@@ -103,8 +103,62 @@ function MarkdownText({ text, fontSize = 14 }: { text: string; fontSize?: number
   )
 }
 
-// ── CBE Row ───────────────────────────────────────────────
-function CBERow({ fact }: { fact: ExtractedFact }) {
+// ── Classification badges ─────────────────────────────────
+
+function InfoClassBadge({ cls }: { cls?: string }) {
+  if (!cls) return null
+  const styles: Record<string, { bg: string; color: string; border: string }> = {
+    Public:       { bg: '#EAF7F0', color: '#1A7F4B', border: 'rgba(26,127,75,0.25)' },
+    Internal:     { bg: '#EFF6FF', color: '#1D4ED8', border: 'rgba(29,78,216,0.25)' },
+    Confidential: { bg: '#FEF9EE', color: '#B45309', border: 'rgba(180,83,9,0.2)' },
+    Restricted:   { bg: '#FEF2F2', color: '#CC2222', border: 'rgba(204,34,34,0.25)' },
+  }
+  const s = styles[cls] || styles.Internal
+  return (
+    <span style={{
+      fontSize: 10, fontWeight: 600, padding: '2px 6px', borderRadius: 4,
+      background: s.bg, color: s.color, border: `0.5px solid ${s.border}`,
+      whiteSpace: 'nowrap' as const, letterSpacing: '0.02em',
+    }}>
+      {cls}
+    </span>
+  )
+}
+
+function PiiClassBadge({ cls }: { cls?: string }) {
+  if (!cls) return null
+  const styles: Record<string, { bg: string; color: string; border: string }> = {
+    PII:       { bg: '#FEF2F2', color: '#CC2222', border: 'rgba(204,34,34,0.25)' },
+    Sensitive: { bg: '#FEF9EE', color: '#B45309', border: 'rgba(180,83,9,0.2)' },
+    'Non-PII': { bg: '#F0EFED', color: '#4A4A4A', border: '#E5E3DF' },
+  }
+  const s = styles[cls] || styles['Non-PII']
+  return (
+    <span style={{
+      fontSize: 10, fontWeight: 600, padding: '2px 6px', borderRadius: 4,
+      background: s.bg, color: s.color, border: `0.5px solid ${s.border}`,
+      whiteSpace: 'nowrap' as const, letterSpacing: '0.02em',
+    }}>
+      {cls}
+    </span>
+  )
+}
+
+function CdeBadge({ isCde }: { isCde?: boolean }) {
+  if (!isCde) return null
+  return (
+    <span style={{
+      fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
+      background: 'var(--wf-red)', color: 'white',
+      whiteSpace: 'nowrap' as const, letterSpacing: '0.04em',
+    }}>
+      CDE
+    </span>
+  )
+}
+
+// ── CDE Row ───────────────────────────────────────────────
+function CDERow({ fact }: { fact: ExtractedFact }) {
   const [expanded, setExpanded] = useState(false)
   const found = fact.value != null
   return (
@@ -117,6 +171,12 @@ function CBERow({ fact }: { fact: ExtractedFact }) {
           {fact.business_definition && (
             <div style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 3, lineHeight: 1.5 }}>{fact.business_definition}</div>
           )}
+          {/* Classification badges */}
+          <div style={{ display: 'flex', gap: 4, marginTop: 5, flexWrap: 'wrap' as const }}>
+            <CdeBadge isCde={fact.is_cde} />
+            <InfoClassBadge cls={fact.info_classification} />
+            <PiiClassBadge cls={fact.pii_classification} />
+          </div>
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           {found ? (
@@ -127,6 +187,11 @@ function CBERow({ fact }: { fact: ExtractedFact }) {
               {fact.not_found_reason && <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>{fact.not_found_reason}</span>}
             </div>
           )}
+          {fact.confidence_rationale && (
+            <div style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 4, fontStyle: 'italic', lineHeight: 1.5 }}>
+              {fact.confidence_rationale}
+            </div>
+          )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
           {fact.provenance?.page && (
@@ -134,8 +199,8 @@ function CBERow({ fact }: { fact: ExtractedFact }) {
               p.{fact.provenance.page}
             </span>
           )}
-          {fact.provenance?.confidence_score != null && (
-            <span style={{ fontSize: 11, color: fact.provenance.confidence_score > 0.85 ? '#1A7F4B' : 'var(--ink-3)' }}>
+          {fact.provenance?.confidence_score != null && fact.provenance.confidence_score > 0 && (
+            <span style={{ fontSize: 11, color: fact.provenance.confidence_score > 0.85 ? '#1A7F4B' : fact.provenance.confidence_score > 0.6 ? '#B45309' : 'var(--ink-3)' }}>
               {(fact.provenance.confidence_score * 100).toFixed(0)}%
             </span>
           )}
@@ -152,6 +217,132 @@ function CBERow({ fact }: { fact: ExtractedFact }) {
         </div>
       )}
     </div>
+  )
+}
+
+// ── Health Score Breakdown ────────────────────────────────
+function HealthBreakdown({ breakdown, score }: { breakdown: Record<string, number>; score?: number }) {
+  const dims = [
+    { key: 'CDE Core Completeness', weight: '40%', color: '#1D4ED8' },
+    { key: 'Provenance Integrity',  weight: '30%', color: '#1A7F4B' },
+    { key: 'Extraction Confidence', weight: '20%', color: '#B45309' },
+    { key: 'Value Validity Rate',   weight: '10%', color: '#7C3AED' },
+  ]
+
+  return (
+    <div style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}>
+      <div style={{ padding: '14px 20px', borderBottom: '0.5px solid var(--border-1)', background: 'var(--surface-2)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Document Health Score</span>
+        {score != null && (
+          <span style={{ fontSize: 20, fontWeight: 700, color: score >= 70 ? '#1A7F4B' : score >= 50 ? '#B45309' : '#CC2222', fontFamily: 'var(--font-display)' }}>
+            {score.toFixed(1)}<span style={{ fontSize: 12, fontWeight: 400, color: 'var(--ink-3)', marginLeft: 2 }}>/100</span>
+          </span>
+        )}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 0 }}>
+        {dims.map((dim, i) => {
+          const val = breakdown[dim.key]
+          return (
+            <div key={dim.key} style={{
+              padding: '18px 16px',
+              borderRight: i < 3 ? '0.5px solid var(--border-1)' : 'none',
+              textAlign: 'center' as const,
+            }}>
+              <div style={{ fontSize: 22, fontWeight: 700, color: dim.color, fontFamily: 'var(--font-display)' }}>
+                {val != null ? `${val.toFixed(1)}%` : '—'}
+              </div>
+              <div style={{ fontSize: 11, fontWeight: 500, color: 'var(--ink-2)', marginTop: 4, lineHeight: 1.4 }}>{dim.key}</div>
+              <div style={{ fontSize: 10, color: 'var(--ink-3)', marginTop: 3 }}>weight {dim.weight}</div>
+              {val != null && (
+                <div style={{ marginTop: 8, height: 4, borderRadius: 2, background: 'var(--surface-3)', overflow: 'hidden' }}>
+                  <div style={{ height: '100%', width: `${Math.min(100, val)}%`, background: dim.color, borderRadius: 2 }} />
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ── Extraction Schema section ─────────────────────────────
+function ExtractionSchemaSection({ schema }: { schema?: DiscoveredField[] }) {
+  const [open, setOpen] = useState(false)
+  if (!schema || schema.length === 0) return null
+
+  const coreFields  = schema.filter(f => f.is_core_field)
+  const cdeFields   = schema.filter(f => f.is_cde && !f.is_core_field)
+  const otherFields = schema.filter(f => !f.is_cde && !f.is_core_field)
+
+  return (
+    <details
+      open={open}
+      onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}
+      style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}
+    >
+      <summary style={{
+        padding: '14px 20px', cursor: 'pointer', listStyle: 'none',
+        display: 'flex', alignItems: 'center', gap: 10,
+        borderBottom: open ? '0.5px solid var(--border-1)' : 'none',
+        background: 'var(--surface-2)',
+      }}>
+        <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>
+          Discovered Extraction Schema
+        </span>
+        <span style={{ fontSize: 12, color: 'var(--ink-3)', fontStyle: 'italic' }}>
+          {schema.length} fields · {coreFields.length} core · {cdeFields.length + coreFields.length} CDEs
+        </span>
+        <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--wf-red)' }}>{open ? '▲ collapse' : '▼ expand'}</span>
+      </summary>
+
+      {open && (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse' as const }}>
+            <thead>
+              <tr style={{ background: 'var(--surface-2)' }}>
+                {['Field', 'Description', 'Type', 'Core', 'CDE', 'Info Class', 'PII Class'].map(h => (
+                  <th key={h} style={{ padding: '8px 14px', textAlign: 'left' as const, fontSize: 10, fontWeight: 500, color: 'var(--ink-3)', textTransform: 'uppercase' as const, letterSpacing: '0.05em', borderBottom: '0.5px solid var(--border-1)', whiteSpace: 'nowrap' as const }}>
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {schema.map((f, i) => (
+                <tr key={i} style={{ background: f.is_core_field ? 'rgba(215,30,43,0.03)' : i % 2 === 0 ? 'var(--surface)' : 'var(--surface-2)', borderBottom: '0.5px solid var(--border-1)' }}>
+                  <td style={{ padding: '9px 14px', fontWeight: f.is_core_field ? 600 : 400, fontSize: 12, color: 'var(--ink)', whiteSpace: 'nowrap' as const, fontFamily: 'monospace' }}>
+                    {f.field_name}
+                  </td>
+                  <td style={{ padding: '9px 14px', fontSize: 12, color: 'var(--ink-2)', lineHeight: 1.5, maxWidth: 340 }}>
+                    {f.description}
+                  </td>
+                  <td style={{ padding: '9px 14px', whiteSpace: 'nowrap' as const }}>
+                    <span style={{ fontSize: 11, fontFamily: 'monospace', background: 'var(--surface-3)', padding: '1px 6px', borderRadius: 3, color: 'var(--ink-2)', border: '0.5px solid var(--border-1)' }}>
+                      {f.semantic_type}
+                    </span>
+                  </td>
+                  <td style={{ padding: '9px 14px', textAlign: 'center' as const }}>
+                    {f.is_core_field
+                      ? <span style={{ fontSize: 12, color: 'var(--wf-red)', fontWeight: 700 }}>★</span>
+                      : <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>—</span>}
+                  </td>
+                  <td style={{ padding: '9px 14px', textAlign: 'center' as const }}>
+                    <CdeBadge isCde={f.is_cde} />
+                  </td>
+                  <td style={{ padding: '9px 14px' }}>
+                    <InfoClassBadge cls={f.info_classification} />
+                  </td>
+                  <td style={{ padding: '9px 14px' }}>
+                    <PiiClassBadge cls={f.pii_classification} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </details>
   )
 }
 
@@ -192,7 +383,6 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
     }
   }
 
-  // ── Pre-run screen ────────────────────────────────────
   if (!results) {
     return (
       <Card title="FR Y-14Q Schedule H Validator" subtitle="Federal Reserve Regulatory Compliance">
@@ -242,7 +432,6 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
     )
   }
 
-  // ── Results screen ────────────────────────────────────
   const { summary, results: validationResults } = results
   const filteredResults = filter === 'all'
     ? validationResults
@@ -250,8 +439,6 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-
-      {/* Scorecard */}
       <div style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-md)', position: 'relative' }}>
         <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3, background: 'linear-gradient(90deg, var(--wf-gold) 0%, var(--wf-gold-dark) 100%)' }}/>
         <div style={{ padding: '16px 20px 14px', borderBottom: '0.5px solid var(--border-1)', background: 'var(--surface-2)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 3 }}>
@@ -276,7 +463,6 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
         </div>
       </div>
 
-      {/* Filter bar */}
       <div style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', padding: '14px 20px', display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' as const }}>
         <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink)' }}>Filter:</span>
         {[
@@ -307,13 +493,11 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
         </span>
       </div>
 
-      {/* Results tables by schedule */}
       {(['H.1', 'H.2', 'H.3', 'H.4'] as const).map(schedule => {
         const scheduleResults = filteredResults.filter((r: any) => r.schedule === schedule)
         if (scheduleResults.length === 0) return null
         return (
           <div key={schedule} style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}>
-            {/* Schedule header */}
             <div style={{ padding: '12px 20px', borderBottom: '0.5px solid var(--border-1)', background: 'var(--surface-2)', display: 'flex', alignItems: 'center', gap: 10 }}>
               <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Schedule {schedule}</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>{scheduleResults.length} fields</span>
@@ -330,7 +514,6 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
                 })}
               </div>
             </div>
-            {/* Table */}
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse' as const }}>
                 <thead>
@@ -351,13 +534,7 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
                         <td style={{ padding: '8px 12px', fontSize: 12, fontWeight: 500, color: 'var(--ink)', whiteSpace: 'nowrap' as const }}>{r.schedule_field}</td>
                         <td style={{ padding: '8px 12px', maxWidth: 160 }}>
                           {r.field_name && r.field_name !== r.schedule_field ? (
-                            <span style={{
-                              fontSize: 11, fontWeight: 500,
-                              background: 'var(--surface-2)', color: 'var(--ink-2)',
-                              border: '0.5px solid var(--border-2)',
-                              padding: '2px 7px', borderRadius: 4,
-                              fontFamily: 'monospace', whiteSpace: 'nowrap' as const,
-                            }}>
+                            <span style={{ fontSize: 11, fontWeight: 500, background: 'var(--surface-2)', color: 'var(--ink-2)', border: '0.5px solid var(--border-2)', padding: '2px 7px', borderRadius: 4, fontFamily: 'monospace', whiteSpace: 'nowrap' as const }}>
                               {r.field_name.replace(/_/g, ' ')}
                             </span>
                           ) : (
@@ -380,10 +557,7 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
                         </td>
                         <td style={{ padding: '8px 12px', whiteSpace: 'nowrap' as const }}>
                           {r.confidence > 0 ? (
-                            <span style={{
-                              fontSize: 11, fontWeight: 600,
-                              color: r.confidence >= 0.85 ? '#1A7F4B' : r.confidence >= 0.6 ? '#B45309' : 'var(--ink-3)',
-                            }}>
+                            <span style={{ fontSize: 11, fontWeight: 600, color: r.confidence >= 0.85 ? '#1A7F4B' : r.confidence >= 0.6 ? '#B45309' : 'var(--ink-3)' }}>
                               {(r.confidence * 100).toFixed(0)}%
                             </span>
                           ) : (
@@ -421,7 +595,6 @@ function FRY14Validator({ profile, results, setResults, filter, setFilter }: {
           </div>
         )
       })}
-
     </div>
   )
 }
@@ -457,34 +630,42 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
     }
   }
 
-  const keyFacts     = ['loan_amount', 'borrower', 'lender', 'maturity_date', 'effective_date', 'interest_rate', 'governing_law', 'guarantor']
-  const overviewCBEs = profile.critical_business_elements?.filter(f => keyFacts.includes(f.field_name) && f.value) || []
+  // Show top CDEs on overview: prefer core fields, then any with values
+  const coreCDEs = profile.critical_data_elements?.filter(f =>
+    f.value && f.is_cde
+  ) || []
+  const overviewCDEs = coreCDEs.slice(0, 8)
 
   // ── OVERVIEW ──────────────────────────────────────────
   if (activeTab === 'overview') {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-        {overviewCBEs.length > 0 && (
+        {overviewCDEs.length > 0 && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
-            {overviewCBEs.slice(0, 8).map((fact, i) => {
-              const isLoan = fact.field_name === 'loan_amount'
+            {overviewCDEs.map((fact, i) => {
+              const isFirst = i === 0
               return (
-                <div key={i} style={{ background: isLoan ? 'var(--wf-red)' : 'var(--surface)', border: `0.5px solid ${isLoan ? 'var(--wf-red)' : 'var(--border-1)'}`, borderRadius: 'var(--radius-lg)', padding: '16px 20px', boxShadow: isLoan ? '0 4px 16px rgba(215,30,43,0.25)' : 'var(--shadow-sm)', borderTop: isLoan ? 'none' : '3px solid var(--wf-gold)', position: 'relative', overflow: 'hidden' }}>
-                  {isLoan && <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3, background: 'var(--wf-gold)' }}/>}
-                  <div style={{ fontSize: 11, color: isLoan ? 'rgba(255,255,255,0.7)' : 'var(--ink-3)', textTransform: 'capitalize', marginBottom: 6, letterSpacing: '0.03em' }}>
+                <div key={i} style={{ background: isFirst ? 'var(--wf-red)' : 'var(--surface)', border: `0.5px solid ${isFirst ? 'var(--wf-red)' : 'var(--border-1)'}`, borderRadius: 'var(--radius-lg)', padding: '16px 20px', boxShadow: isFirst ? '0 4px 16px rgba(215,30,43,0.25)' : 'var(--shadow-sm)', borderTop: isFirst ? 'none' : '3px solid var(--wf-gold)', position: 'relative', overflow: 'hidden' }}>
+                  {isFirst && <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3, background: 'var(--wf-gold)' }}/>}
+                  <div style={{ fontSize: 11, color: isFirst ? 'rgba(255,255,255,0.7)' : 'var(--ink-3)', textTransform: 'capitalize', marginBottom: 6, letterSpacing: '0.03em' }}>
                     {fact.field_name.replace(/_/g, ' ')}
                   </div>
-                  <div style={{ fontSize: isLoan ? 22 : 15, fontWeight: 700, color: isLoan ? 'white' : 'var(--ink)', fontFamily: 'var(--font-display)', lineHeight: 1.2, wordBreak: 'break-word' }}>
+                  <div style={{ fontSize: isFirst ? 22 : 15, fontWeight: 700, color: isFirst ? 'white' : 'var(--ink)', fontFamily: 'var(--font-display)', lineHeight: 1.2, wordBreak: 'break-word' }}>
                     {fact.value}
                   </div>
                   {fact.provenance?.page && (
-                    <div style={{ fontSize: 10, color: isLoan ? 'rgba(255,205,65,0.9)' : 'var(--ink-3)', marginTop: 4 }}>p.{fact.provenance.page}</div>
+                    <div style={{ fontSize: 10, color: isFirst ? 'rgba(255,205,65,0.9)' : 'var(--ink-3)', marginTop: 4 }}>p.{fact.provenance.page}</div>
                   )}
                 </div>
               )
             })}
           </div>
+        )}
+
+        {/* Health score with four dimensions */}
+        {profile.health_breakdown && Object.keys(profile.health_breakdown).length > 0 && (
+          <HealthBreakdown breakdown={profile.health_breakdown} score={profile.health_score} />
         )}
 
         <Card title="Document Fingerprint">
@@ -505,15 +686,128 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
           </div>
         </Card>
 
-        {profile.sections_detected && profile.sections_detected.length > 0 && (
-          <Card title="Sections Detected">
-            <div style={{ padding: '16px 20px', display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-              {profile.sections_detected.map((s, i) => (
-                <span key={i} style={{ fontSize: 12, background: 'var(--surface-2)', border: '0.5px solid var(--border-1)', padding: '4px 10px', borderRadius: 4, color: 'var(--ink-2)' }}>{s}</span>
-              ))}
+        {profile.sections_detected && profile.sections_detected.length > 0 && (() => {
+          const sections = profile.sections_detected
+          const articleCount = sections.filter(s => /^ARTICLE/i.test(s.trim())).length
+          const sectionCount = sections.filter(s => /^Section/i.test(s.trim())).length
+
+          return (
+            <div style={{
+              background: 'var(--surface)',
+              border: '0.5px solid var(--border-1)',
+              borderRadius: 'var(--radius-lg)',
+              overflow: 'hidden',
+              boxShadow: 'var(--shadow-sm)',
+            }}>
+              {/* Header */}
+              <div style={{
+                padding: '14px 20px',
+                borderBottom: '0.5px solid var(--border-1)',
+                background: 'var(--surface-2)',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+              }}>
+                <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Document Structure</span>
+                <div style={{ display: 'flex', gap: 6, marginLeft: 4 }}>
+                  {articleCount > 0 && (
+                    <span style={{ fontSize: 11, fontWeight: 500, padding: '2px 8px', borderRadius: 10, background: 'var(--wf-red-light)', color: 'var(--wf-red)', border: '0.5px solid rgba(215,30,43,0.2)' }}>
+                      {articleCount} {articleCount === 1 ? 'Article' : 'Articles'}
+                    </span>
+                  )}
+                  {sectionCount > 0 && (
+                    <span style={{ fontSize: 11, fontWeight: 500, padding: '2px 8px', borderRadius: 10, background: 'var(--wf-gold-light)', color: 'var(--wf-gold-dark)', border: '0.5px solid rgba(201,162,39,0.25)' }}>
+                      {sectionCount} {sectionCount === 1 ? 'Section' : 'Sections'}
+                    </span>
+                  )}
+                </div>
+                <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--ink-3)' }}>
+                  {sections.length} total
+                </span>
+              </div>
+
+              {/* Two-column grid */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr' }}>
+                {sections.map((s, i) => {
+                  const isArticle = /^ARTICLE/i.test(s.trim())
+                  const isSection = /^Section/i.test(s.trim())
+                  const m = s.match(/^((?:ARTICLE|Section)\s+[\w.]+)\s*[\-:—]?\s*(.*)/i)
+                  const prefix = m ? m[1].trim() : s.trim()
+                  const title  = m ? m[2].trim() : ''
+                  const isLastRow = i >= sections.length - (sections.length % 2 === 0 ? 2 : 1)
+                  const isRightCol = (i + 1) % 2 === 0
+
+                  return (
+                    <div key={i} style={{
+                      padding: '13px 20px',
+                      borderBottom: isLastRow ? 'none' : '0.5px solid var(--border-1)',
+                      borderRight: isRightCol ? 'none' : '0.5px solid var(--border-1)',
+                      display: 'flex',
+                      alignItems: 'flex-start',
+                      gap: 12,
+                      background: isArticle ? 'rgba(215,30,43,0.018)' : 'transparent',
+                    }}>
+                      {/* Index bubble */}
+                      <div style={{
+                        width: 24,
+                        height: 24,
+                        borderRadius: '50%',
+                        flexShrink: 0,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontSize: 10,
+                        fontWeight: 700,
+                        marginTop: 1,
+                        background: isArticle
+                          ? 'var(--wf-red)'
+                          : isSection
+                          ? 'var(--wf-gold-light)'
+                          : 'var(--surface-3)',
+                        color: isArticle
+                          ? 'white'
+                          : isSection
+                          ? 'var(--wf-gold-dark)'
+                          : 'var(--ink-3)',
+                        border: isSection ? '0.5px solid rgba(201,162,39,0.4)' : 'none',
+                      }}>
+                        {i + 1}
+                      </div>
+
+                      {/* Text */}
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{
+                          fontSize: 12,
+                          fontWeight: 700,
+                          color: isArticle ? 'var(--wf-red)' : 'var(--ink)',
+                          letterSpacing: isArticle ? '0.04em' : '0.01em',
+                          textTransform: isArticle ? 'uppercase' as const : 'none' as const,
+                          lineHeight: 1.3,
+                        }}>
+                          {prefix}
+                        </div>
+                        {title && (
+                          <div style={{
+                            fontSize: 11,
+                            color: 'var(--ink-3)',
+                            marginTop: 3,
+                            lineHeight: 1.45,
+                            overflow: 'hidden',
+                            display: '-webkit-box',
+                            WebkitLineClamp: 2,
+                            WebkitBoxOrient: 'vertical' as const,
+                          }}>
+                            {title}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
             </div>
-          </Card>
-        )}
+          )
+        })()}
 
         {profile.parties && profile.parties.length > 0 && (
           <Card title="Parties Identified">
@@ -533,18 +827,27 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
     )
   }
 
-  // ── BUSINESS ELEMENTS ────────────────────────────────
+  // ── CRITICAL DATA ELEMENTS ────────────────────────────
   if (activeTab === 'elements') {
+    const foundCount   = profile.critical_data_elements?.filter(f => f.value).length || 0
+    const missingCount = profile.critical_data_elements?.filter(f => !f.value).length || 0
+
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-        <Card title="Critical Business Elements" subtitle={`${profile.critical_business_elements?.filter(f => f.value).length || 0} found · ${profile.critical_business_elements?.filter(f => !f.value).length || 0} missing`}>
-          {profile.critical_business_elements?.map((fact, i) => <CBERow key={i} fact={fact} />)}
+        {/* Discovered schema (collapsible) */}
+        <ExtractionSchemaSection schema={profile.extraction_schema} />
+
+        <Card
+          title="Critical Data Elements"
+          subtitle={`${foundCount} found · ${missingCount} missing`}
+        >
+          {profile.critical_data_elements?.map((fact, i) => <CDERow key={i} fact={fact} />)}
         </Card>
 
         {profile.additional_findings && profile.additional_findings.length > 0 && (
           <Card title="Additional Findings" subtitle="Discovered beyond standard schema" goldTop>
-            {profile.additional_findings.map((fact, i) => <CBERow key={i} fact={fact} />)}
+            {profile.additional_findings.map((fact, i) => <CDERow key={i} fact={fact} />)}
           </Card>
         )}
 
@@ -598,7 +901,7 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
         {profile.summary?.detailed && (
           <details style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}>
             <summary style={{ padding: '16px 20px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, listStyle: 'none', borderBottom: '0.5px solid var(--border-1)', background: 'var(--surface-2)' }}>
-              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Detailed Deal Memo</span>
+              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Detailed Summary</span>
               <Badge variant="neutral" label="Click to expand" />
             </summary>
             <div style={{ padding: '24px' }}><MarkdownText text={profile.summary.detailed} fontSize={14} /></div>
@@ -608,7 +911,6 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
         <Card title="Page-by-Page Summary" subtitle="Select a page · LLM generates the summary on demand">
           <div style={{ padding: '24px' }}>
 
-            {/* Page selector row */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20, flexWrap: 'wrap' }}>
               <span style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-2)' }}>Select page:</span>
               <select
@@ -630,7 +932,6 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
               </button>
             </div>
 
-            {/* Loading */}
             {loadingPage && (
               <div style={{ textAlign: 'center', padding: '28px' }}>
                 <div style={{ width: 36, height: 36, border: '3px solid var(--surface-tertiary)', borderTop: '3px solid var(--wf-red)', borderRadius: '50%', margin: '0 auto 14px', animation: 'spin 1s linear infinite' }}/>
@@ -639,14 +940,12 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
               </div>
             )}
 
-            {/* Error */}
             {pageError && !loadingPage && (
               <div style={{ padding: '12px 16px', background: 'var(--wf-red-light)', border: '0.5px solid rgba(215,30,43,0.3)', borderRadius: 'var(--radius-md)', color: 'var(--wf-red)', fontSize: 13 }}>
                 {pageError}
               </div>
             )}
 
-            {/* Result */}
             {pageResult && !loadingPage && (
               <div style={{ background: 'var(--surface-2)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-md)', padding: '20px 24px' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
@@ -669,7 +968,6 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
               </div>
             )}
 
-            {/* Prompt before any action */}
             {!pageResult && !loadingPage && !pageError && (
               <div style={{ textAlign: 'center', padding: '20px 0', color: 'var(--ink-3)', fontSize: 13 }}>
                 Select a page above and click <strong style={{ color: 'var(--ink-2)' }}>Generate Summary</strong> — the LLM will summarise only that page.
@@ -678,6 +976,16 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
 
           </div>
         </Card>
+
+        {profile.raw_llm_narrative && (
+          <details style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}>
+            <summary style={{ padding: '16px 20px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, listStyle: 'none', borderBottom: '0.5px solid var(--border-1)', background: 'var(--surface-2)' }}>
+              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Free Narrative</span>
+              <Badge variant="neutral" label="Click to expand" />
+            </summary>
+            <div style={{ padding: '24px' }}><MarkdownText text={profile.raw_llm_narrative} fontSize={13} /></div>
+          </details>
+        )}
 
       </div>
     )
@@ -717,17 +1025,17 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
   // ── DATA DICTIONARY ──────────────────────────────────
   if (activeTab === 'dictionary') {
     const allFacts = [
-      ...(profile.critical_business_elements || []),
+      ...(profile.critical_data_elements || []),
       ...(profile.additional_findings || []),
     ].filter(f => f.value)
 
     return (
-      <Card title="Business Data Dictionary" subtitle={`${allFacts.length} terms · Auto-generated by LLM`}>
+      <Card title="Data Dictionary" subtitle={`${allFacts.length} terms · Auto-generated by LLM`}>
         <div style={{ overflowX: 'auto' }}>
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: 'var(--surface-2)' }}>
-                {['Term', 'Value', 'Business Definition', 'Source Page', 'Confidence', 'Sensitivity'].map(h => (
+                {['Term', 'Value', 'Business Definition', 'Source Page', 'Confidence', 'CDE', 'Info Class', 'PII Class'].map(h => (
                   <th key={h} style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 500, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.05em', borderBottom: '0.5px solid var(--border-1)', whiteSpace: 'nowrap' }}>{h}</th>
                 ))}
               </tr>
@@ -744,12 +1052,18 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
                       : <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>—</span>}
                   </td>
                   <td style={{ padding: '12px 16px' }}>
-                    {fact.provenance?.confidence_score != null
+                    {fact.provenance?.confidence_score != null && fact.provenance.confidence_score > 0
                       ? <Badge variant={fact.provenance.confidence_score > 0.85 ? 'high' : fact.provenance.confidence_score > 0.6 ? 'medium' : 'low'} label={`${(fact.provenance.confidence_score * 100).toFixed(0)}%`} />
                       : <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>—</span>}
                   </td>
+                  <td style={{ padding: '12px 16px', textAlign: 'center' }}>
+                    <CdeBadge isCde={fact.is_cde} />
+                  </td>
                   <td style={{ padding: '12px 16px' }}>
-                    <Badge variant={fact.sensitivity as any} label={fact.sensitivity || 'internal'} />
+                    <InfoClassBadge cls={fact.info_classification} />
+                  </td>
+                  <td style={{ padding: '12px 16px' }}>
+                    <PiiClassBadge cls={fact.pii_classification} />
                   </td>
                 </tr>
               ))}

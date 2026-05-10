@@ -82,17 +82,17 @@ def tool_search_profile(profile: dict, query: str) -> dict:
         if any(w in query_lower for w in ["primary key", "join", "dependency", "intelligence", "pattern"]):
             results["cross_column_intelligence"] = profile.get("raw_llm_narrative", "")
 
-    # Unstructured — CBE search
+    # Unstructured — CDE search
     if modality == "unstructured":
-        cbes = profile.get("critical_business_elements", [])
+        cdes = profile.get("critical_data_elements", [])
         matching = [
-            f for f in cbes
+            f for f in cdes
             if (query_lower in f.get("field_name", "").lower() or
                 query_lower in str(f.get("value") or "").lower() or
                 any(w in query_lower for w in ["all", "every", "list"]))
         ]
         if matching:
-            results["critical_business_elements"] = matching[:15]
+            results["critical_data_elements"] = matching[:15]
 
         findings = profile.get("additional_findings", [])
         matching_findings = [
@@ -131,7 +131,7 @@ def tool_search_profile(profile: dict, query: str) -> dict:
     if modality == "semi_structured":
         results["row_count"] = profile.get("row_count")
         results["column_count"] = profile.get("column_count")
-        results["schema_fields"] = profile.get("critical_business_elements", [])[:10]
+        results["schema_fields"] = profile.get("critical_data_elements", [])[:10]
 
     return results if results else {"message": "No relevant data found for this query in the profile."}
 

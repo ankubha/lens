@@ -21,11 +21,12 @@ print(f"Health Score    : {result.health_score}/100")
 print(f"Completeness    : {result.completeness_score}% ({result.found_fields_count}/{result.expected_fields_count} fields)")
 print()
 
-print("── CRITICAL BUSINESS ELEMENTS ──")
-for cbe in result.critical_business_elements:
-    status = str(cbe.value) if cbe.value else f"NOT FOUND ({cbe.not_found_reason})"
-    page = f"p.{cbe.provenance.page}" if cbe.provenance and cbe.provenance.page else ""
-    print(f"  {cbe.field_name:20} : {status:40} {page}")
+print("── CRITICAL DATA ELEMENTS ──")
+for cde in result.critical_data_elements:
+    status = str(cde.value) if cde.value else f"NOT FOUND ({cde.not_found_reason})"
+    page = f"p.{cde.provenance.page}" if cde.provenance and cde.provenance.page else ""
+    conf = f" [{(cde.provenance.confidence_score*100):.0f}%]" if cde.provenance and cde.provenance.confidence_score else ""
+    print(f"  {cde.field_name:20} : {status:40} {page}{conf}")
 
 print()
 print("── MONETARY AMOUNTS FOUND ──")

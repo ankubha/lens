@@ -224,7 +224,7 @@ export default function ProfilePage({ params }: { params: Promise<{ id: string }
             { label: 'Fields',            value: profile.column_count?.toString() || '—',      sub: 'detected paths' },
             { label: 'Duplicate Records', value: profile.duplicate_row_count?.toString() || '0', sub: 'exact matches', alert: (profile.duplicate_row_count || 0) > 0 },
             { label: 'Health Score',      value: `${profile.health_score?.toFixed(0) || 0}/100`, sub: 'overall quality' },
-            { label: 'Schema Fields',     value: profile.critical_business_elements?.length.toString() || '0', sub: 'paths analysed' },
+            { label: 'Schema Fields',     value: profile.critical_data_elements?.length.toString() || '0', sub: 'paths analysed' },
           ].map((stat: any) => (
             <div key={stat.label} style={{
               background: stat.alert ? 'var(--wf-red-light)' : 'var(--surface-2)',

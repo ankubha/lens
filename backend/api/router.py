@@ -94,7 +94,7 @@ _load_all()
 
 # Supported file types
 STRUCTURED_EXTENSIONS   = {".csv", ".xlsx", ".xls"}
-UNSTRUCTURED_EXTENSIONS = {".pdf"}
+UNSTRUCTURED_EXTENSIONS = {".pdf", ".docx"}
 SEMI_STRUCTURED_EXTENSIONS = {".json", ".xml"}
 
 ALL_SUPPORTED = (

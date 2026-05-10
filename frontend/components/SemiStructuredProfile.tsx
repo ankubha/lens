@@ -15,7 +15,7 @@ export default function SemiStructuredProfile({ profile, activeTab }: Props) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-        {/* File info */}
+        {/* Stats bar */}
         <div style={{
           background: 'var(--surface)',
           border: '0.5px solid var(--border-1)',
@@ -30,28 +30,34 @@ export default function SemiStructuredProfile({ profile, activeTab }: Props) {
           }}/>
           <div style={{
             display: 'grid',
-            gridTemplateColumns: 'repeat(4, 1fr)',
+            gridTemplateColumns: 'repeat(5, 1fr)',
             gap: 0,
             paddingTop: 3,
           }}>
             {[
-              { label: 'Format', value: profile.document_type.toUpperCase() },
-              { label: 'Total Records', value: profile.row_count?.toLocaleString() || '—' },
-              { label: 'Fields Detected', value: profile.column_count?.toString() || '—' },
-              { label: 'Duplicate Records', value: profile.duplicate_row_count?.toString() || '0' },
-            ].map((item, i) => (
+              { label: 'Format',           value: profile.document_type.toUpperCase() },
+              { label: 'Total Records',    value: profile.row_count?.toLocaleString() || '—' },
+              { label: 'Fields Detected',  value: profile.column_count?.toString() || '—' },
+              { label: 'Duplicate Records',value: profile.duplicate_row_count?.toString() || '0',
+                alert: (profile.duplicate_row_count || 0) > 0 },
+              { label: 'Health Score',     value: `${profile.health_score?.toFixed(0) ?? '—'}/100` },
+            ].map((item: any, i) => (
               <div key={item.label} style={{
                 padding: '20px 24px',
-                borderRight: i < 3 ? '0.5px solid var(--border-1)' : 'none',
+                borderRight: i < 4 ? '0.5px solid var(--border-1)' : 'none',
+                background: item.alert ? 'var(--wf-red-light)' : 'transparent',
               }}>
                 <div style={{ fontSize: 11, color: 'var(--ink-3)', marginBottom: 4 }}>{item.label}</div>
-                <div style={{ fontSize: 22, fontWeight: 700, color: 'var(--ink)', fontFamily: 'var(--font-display)' }}>{item.value}</div>
+                <div style={{
+                  fontSize: 22, fontWeight: 700, fontFamily: 'var(--font-display)',
+                  color: item.alert ? 'var(--wf-red)' : 'var(--ink)',
+                }}>{item.value}</div>
               </div>
             ))}
           </div>
         </div>
 
-        {/* LLM schema summary */}
+        {/* Cross-column intelligence */}
         {profile.raw_llm_narrative && (
           <div style={{
             background: 'var(--surface)',
@@ -68,7 +74,7 @@ export default function SemiStructuredProfile({ profile, activeTab }: Props) {
               alignItems: 'center',
               gap: 10,
             }}>
-              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Schema Intelligence</span>
+              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Cross-Column Intelligence</span>
               <Badge variant="info" label="AI Generated" />
             </div>
             <div style={{
@@ -76,6 +82,7 @@ export default function SemiStructuredProfile({ profile, activeTab }: Props) {
               fontSize: 14,
               color: 'var(--ink-2)',
               lineHeight: 1.8,
+              whiteSpace: 'pre-wrap' as const,
             }}>
               {profile.raw_llm_narrative}
             </div>
@@ -88,7 +95,7 @@ export default function SemiStructuredProfile({ profile, activeTab }: Props) {
 
   // ── SCHEMA ANALYSIS ──────────────────────────────────────
   if (activeTab === 'schema') {
-    const facts = profile.critical_business_elements || []
+    const facts = profile.critical_data_elements || []
 
     return (
       <div style={{

@@ -5,7 +5,7 @@ import { profileFile } from '@/lib/api'
 import LensBot from '@/components/LensBot'
 import DataForge from '@/components/DataForge'
 
-const SUPPORTED = ['.csv', '.xlsx', '.xls', '.pdf', '.json', '.xml']
+const SUPPORTED = ['.csv', '.xlsx', '.xls', '.pdf', '.docx', '.json', '.xml']
 
 export default function HomePage() {
   const router = useRouter()
@@ -38,7 +38,7 @@ export default function HomePage() {
       return
     }
     setUploading(true)
-    const isUnstructured = ext === '.pdf'
+    const isUnstructured = ext === '.pdf' || ext === '.docx'
     const messages = isUnstructured
       ? ['Analysing document structure...', 'Extracting text from all pages...', 'Running LLM extraction...', 'Generating executive summary...', 'Building data dictionary...', 'Finalising profile...']
       : ['Loading dataset...', 'Profiling columns...', 'Computing statistics...', 'Detecting PII and semantic types...', 'Calculating health score...']
@@ -92,7 +92,7 @@ export default function HomePage() {
               <span style={{ color: 'var(--wf-red)' }}>Understand everything.</span>
             </h1>
             <p style={{ fontSize: 17, color: 'var(--ink-2)', maxWidth: 560, margin: '0 auto', lineHeight: 1.7 }}>
-              Drop a CSV, Excel, PDF, or JSON file. Lens auto-detects the type and returns
+              Drop a CSV, Excel, PDF, Word (.docx), or JSON file. Lens auto-detects the type and returns
               structured intelligence — health scores, extracted facts, summaries, and a full data dictionary.
             </p>
           </div>
@@ -156,6 +156,7 @@ export default function HomePage() {
                     { label: 'CSV',  type: 'structured'   },
                     { label: 'XLSX', type: 'structured'   },
                     { label: 'PDF',  type: 'unstructured' },
+                    { label: 'DOCX', type: 'unstructured' },
                     { label: 'JSON', type: 'semi'         },
                     { label: 'XML',  type: 'semi'         },
                   ].map(f => (
@@ -186,7 +187,7 @@ export default function HomePage() {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginTop: 48 }}>
             {[
               { icon: '📊', title: 'Structured Profiling', desc: 'Full statistical analysis, PII detection, semantic typing, health scores, and drift detection for CSV and Excel files.', border: 'rgba(29,78,216,0.15)' },
-              { icon: '📄', title: 'Document Intelligence', desc: 'Extract critical business elements, generate tiered summaries, and build a data dictionary from any PDF document.', border: 'rgba(215,30,43,0.15)' },
+              { icon: '📄', title: 'Document Intelligence', desc: 'Extract critical data elements, generate tiered summaries, and build a data dictionary from any PDF or Word document.', border: 'rgba(215,30,43,0.15)' },
               { icon: '{ }', title: 'Semi-structured', desc: 'Profile JSON and XML feeds. Schema inference, field coverage, and type detection across batches.', border: 'rgba(180,83,9,0.15)' },
             ].map(card => (
               <div key={card.title} style={{

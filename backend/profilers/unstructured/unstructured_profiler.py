@@ -2,14 +2,15 @@
 Lens — Unstructured Profiler
 =============================
 Processes PDF documents through two layers:
-  Layer 1 — Document fingerprint (deterministic, instant)
-  Layer 2 — Groq/Llama 4 Scout (full document, no hardcoding)
+  Layer 1   — Document fingerprint (deterministic, instant)
+  Layer 1.5 — Schema discovery (LLM decides what fields to extract)
+  Layer 2   — Groq/Llama 4 Scout (full document extraction)
 
 Anti-hallucination guarantee:
-  Every fact carries (value, page, confidence).
+  Every fact carries (value, page, confidence, confidence_rationale).
   Missing fields return None with reason. Never invented.
-  Every field gets a short generic business definition — auto data dictionary.
-  Full document sent to LLM — works for ANY document type.
+  Discovered schema is the single source of truth for what gets extracted.
+  No hardcoded field names anywhere.
 """
 
 from __future__ import annotations
@@ -39,7 +40,9 @@ from backend.models.profile_contract import (
     DocumentSummary,
     RiskObligation,
     ConfidenceLevel,
+    DiscoveredField,
 )
+from backend.profilers.unstructured.validity import validate_extracted_value
 
 load_dotenv()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -105,8 +108,7 @@ def clean_json(text: str) -> str:
 
     json_str = text[start:end+1]
 
-    # Fix common LLM JSON issues
-    # Remove trailing commas before ] or }
+    # Fix common LLM JSON issues — trailing commas before ] or }
     json_str = re.sub(r',\s*\]', ']', json_str)
     json_str = re.sub(r',\s*\}', '}', json_str)
 
@@ -190,117 +192,257 @@ def extract_fingerprint(pdf, path: Path) -> dict:
 
 
 # ─────────────────────────────────────────────
-# LAYER 2 — LLM EXTRACTION
-# No hardcoding. Full document sent. Works for any document type.
+# DOC-TYPE PROMPT CONFIGS
+# Drives perspective and structure for all three summary generators.
 # ─────────────────────────────────────────────
 
-CORE_FIELDS = [
-    "loan_amount",
-    "interest_rate",
-    "applicable_margin",
-    "maturity_date",
-    "effective_date",
-    "borrower",
-    "lender",
-    "guarantor",
-    "governing_law",
-    "property_address",
-    "default_rate",
-]
+DOC_TYPE_PROMPT_CONFIGS: dict[DocumentType, dict] = {
+    DocumentType.COMMERCIAL_LOAN: {
+        "perspective": "senior credit officer",
+        "summary_sections": [
+            "Transaction Overview", "Parties and Roles", "Financial Terms",
+            "Collateral and Security", "Key Covenants", "Events of Default",
+            "Governing Law and Jurisdiction", "Notable Provisions",
+        ],
+    },
+    DocumentType.TERM_SHEET: {
+        "perspective": "senior credit officer",
+        "summary_sections": [
+            "Transaction Overview", "Key Terms", "Conditions to Closing",
+            "Parties", "Fees and Economics", "Expiry and Next Steps",
+        ],
+    },
+    DocumentType.CREDIT_MEMO: {
+        "perspective": "senior credit officer",
+        "summary_sections": [
+            "Credit Recommendation", "Borrower Overview", "Transaction Structure",
+            "Financial Analysis", "Risk Factors", "Mitigants", "Conclusion",
+        ],
+    },
+    DocumentType.FINANCIAL_STATEMENT: {
+        "perspective": "senior financial analyst",
+        "summary_sections": [
+            "Financial Highlights", "Balance Sheet Overview", "Income Statement",
+            "Cash Flow Analysis", "Key Ratios", "Auditor Opinion", "Material Items",
+        ],
+    },
+    DocumentType.MSA: {
+        "perspective": "senior contracts counsel",
+        "summary_sections": [
+            "Agreement Overview", "Parties and Scope", "Key Obligations",
+            "Pricing and Payment", "Term and Termination",
+            "Liability and Indemnification", "Governing Law", "Notable Provisions",
+        ],
+    },
+    DocumentType.GENERIC_PDF: {
+        "perspective": "senior business analyst",
+        "summary_sections": None,  # LLM decides structure
+    },
+}
 
-CORE_HEALTH_FIELDS = [
-    "loan_amount", "maturity_date", "effective_date",
-    "borrower", "lender", "governing_law",
-]
+
+def _get_doc_config(doc_type: DocumentType) -> dict:
+    return DOC_TYPE_PROMPT_CONFIGS.get(
+        doc_type,
+        DOC_TYPE_PROMPT_CONFIGS[DocumentType.GENERIC_PDF],
+    )
 
 
-def extract_cbes(full_text: str) -> list[ExtractedFact]:
+# ─────────────────────────────────────────────
+# LAYER 1.5 — SCHEMA DISCOVERY
+# One LLM call that decides what to extract before extraction begins.
+# ─────────────────────────────────────────────
+
+def discover_extraction_schema(
+    doc_type: DocumentType,
+    text_excerpt: str,
+) -> list[DiscoveredField]:
     """
-    Extract Critical Business Elements from the full document.
-    Full text sent — no page chunking, no hardcoding.
-    Works for any financial document type.
+    LLM call that discovers which fields to extract from this specific document.
+    Runs immediately after Layer 1 fingerprinting, before any extraction.
+    The returned list is the single source of truth for all downstream extraction.
     """
-    prompt = f"""You are a senior financial analyst extracting key facts from a financial document.
+    prompt = f"""You are a document analysis expert. Read the document type and opening excerpt below.
+Return a JSON list of all fields that should be extracted from this specific document.
 
-Read the ENTIRE document below carefully and extract these fields.
-For each field provide:
-1. The exact value as written in the document
-2. The page number where it appears (look for page indicators like "1/95" in the text)
-3. The exact phrase it was extracted from
-4. A short generic business definition (1 sentence, plain English, universally applicable)
+Document type: {doc_type.value}
+
+For each field return:
+- field_name: snake_case identifier (e.g. effective_date, total_commitment)
+- description: one sentence explaining what this field represents
+- semantic_type: one of: date / currency / percentage / entity_name / string / boolean
+- is_cde: true if this field is material to regulatory reporting or key business decisions, false otherwise
+- is_core_field: true ONLY for the 5-6 most critical fields that define this document's identity. Mark false for everything else.
+- info_classification: one of: Public / Internal / Confidential / Restricted
+- pii_classification: one of: PII / Sensitive / Non-PII
+
+Rules:
+- Base the field list on what you actually see in this document's excerpt
+- Mark is_core_field=true for at most 6 fields — the absolute must-haves for this document
+- Mark is_cde=true for all fields material to regulatory reporting or major decisions
+- Do NOT include generic meta-fields like document_title or page_count
+- Return JSON only, no preamble, no markdown fences
+
+OPENING EXCERPT (first 3000 chars):
+{text_excerpt[:3000]}
+
+Return format:
+[
+  {{
+    "field_name": "effective_date",
+    "description": "The date on which this agreement becomes legally binding.",
+    "semantic_type": "date",
+    "is_cde": true,
+    "is_core_field": true,
+    "info_classification": "Internal",
+    "pii_classification": "Non-PII"
+  }}
+]"""
+
+    response = call_llm(prompt)
+    fields = []
+    try:
+        items = json.loads(clean_json(response))
+        for item in items:
+            fields.append(DiscoveredField(
+                field_name=item.get("field_name", ""),
+                description=item.get("description", ""),
+                semantic_type=item.get("semantic_type", "string"),
+                is_cde=bool(item.get("is_cde", False)),
+                is_core_field=bool(item.get("is_core_field", False)),
+                info_classification=item.get("info_classification", "Internal"),
+                pii_classification=item.get("pii_classification", "Non-PII"),
+            ))
+    except Exception as e:
+        print(f"  [Lens] Schema discovery parse error: {e}")
+        print(f"  [Lens] Raw response: {response[:300]}")
+
+    return fields
+
+
+# ─────────────────────────────────────────────
+# LAYER 2 — LLM EXTRACTION
+# Driven entirely by discovered schema. No hardcoded field names.
+# ─────────────────────────────────────────────
+
+def extract_cdes(
+    full_text: str,
+    discovered_schema: list[DiscoveredField],
+) -> list[ExtractedFact]:
+    """
+    Extract Critical Data Elements from the full document.
+    Field list comes entirely from the discovered schema — no hardcoding.
+    LLM self-assesses confidence for each field based on evidence quality.
+    """
+    if not discovered_schema:
+        return []
+
+    field_lines = "\n".join(
+        f"- {f.field_name}: {f.description}"
+        for f in discovered_schema
+    )
+
+    prompt = f"""You are a senior financial analyst extracting key facts from a document.
+
+Read the ENTIRE document below and extract EVERY field listed.
+
+For each field, self-assess your confidence score (0.0–1.0) based on:
+- How explicitly the value was labeled in the document
+- Whether there were conflicting mentions of the same value
+- Whether you read the value directly vs. had to infer it
+Do NOT use any default confidence number. Be honest.
 
 Fields to extract:
-- loan_amount
-- interest_rate (full rate description including benchmark + margin if applicable)
-- applicable_margin
-- maturity_date
-- effective_date
-- borrower
-- lender
-- guarantor
-- governing_law
-- property_address
-- default_rate
+{field_lines}
 
-CRITICAL RULES:
-1. Read the ENTIRE document — answers may appear anywhere
-2. Only extract values EXPLICITLY stated — never invent or infer
-3. If genuinely not found after reading everything, set value to null
-4. Business definitions must be short (1 sentence), generic, plain English
-5. For page numbers look for patterns like "1/95", "2/95" in the text
+For each field return:
+- field_name: exactly as listed above
+- value: exact value as written in the document, or null if genuinely not found after reading everything
+- raw_text: the exact phrase the value was extracted from (null if not found)
+- confidence: float 0.0–1.0, your honest self-assessed confidence for this specific extraction
+- confidence_rationale: one sentence explaining your confidence score
+- not_found_reason: brief reason if value is null (otherwise null)
+- page: page number where found (look for patterns like "1/95", "Page 2"), or null
 
 Respond ONLY with a JSON array, no markdown, no backticks:
 [
   {{
-    "field": "loan_amount",
-    "value": "$38,000,000.00",
-    "business_definition": "The total principal amount borrowed under the agreement.",
-    "page": 1,
-    "raw_text": "original principal amount of $38,000,000.00",
-    "not_found_reason": null
+    "field_name": "effective_date",
+    "value": "January 15, 2024",
+    "raw_text": "entered into as of January 15, 2024",
+    "confidence": 0.97,
+    "confidence_rationale": "Explicitly labeled in the preamble with no conflicting mentions.",
+    "not_found_reason": null,
+    "page": 1
   }},
   {{
-    "field": "guarantor",
+    "field_name": "prepayment_fee",
     "value": null,
-    "business_definition": "The entity providing a guarantee of repayment on behalf of the borrower.",
-    "page": null,
     "raw_text": null,
-    "not_found_reason": "No guarantor clause found in the document"
+    "confidence": 0.0,
+    "confidence_rationale": "Searched the entire document; no prepayment fee clause present.",
+    "not_found_reason": "No prepayment fee clause found in the document",
+    "page": null
   }}
 ]
 
 FULL DOCUMENT TEXT (beginning):
 {full_text[:60000]}
 
-FULL DOCUMENT TEXT (end — contains governing law and general provisions):
+FULL DOCUMENT TEXT (end — may contain general provisions):
 {full_text[-10000:]}
 """
 
     response = call_llm(prompt)
     facts = []
+    schema_map = {f.field_name: f for f in discovered_schema}
 
     try:
         items = json.loads(clean_json(response))
         for item in items:
-            field = item.get("field", "")
+            field_name = item.get("field_name", "")
             value = item.get("value")
             page = item.get("page")
+            raw_confidence = item.get("confidence")
+            schema_field = schema_map.get(field_name)
+
+            if schema_field is None:
+                continue
+
+            confidence: float | None = None
+            if raw_confidence is not None:
+                try:
+                    confidence = float(raw_confidence)
+                    confidence = max(0.0, min(1.0, confidence))
+                except (ValueError, TypeError):
+                    confidence = None
+
+            confidence_level = ConfidenceLevel.LOW
+            if confidence is not None:
+                if confidence > 0.85:
+                    confidence_level = ConfidenceLevel.HIGH
+                elif confidence >= 0.60:
+                    confidence_level = ConfidenceLevel.MEDIUM
 
             facts.append(ExtractedFact(
-                field_name=field,
-                business_definition=item.get("business_definition"),
+                field_name=field_name,
+                business_definition=schema_field.description,
                 value=value,
                 raw_text=item.get("raw_text"),
                 not_found_reason=item.get("not_found_reason") if not value else None,
+                confidence_rationale=item.get("confidence_rationale"),
                 provenance=ProvenanceSpan(
                     page=page,
-                    confidence_score=0.92 if value else 0.0,
-                    confidence_level=ConfidenceLevel.HIGH if value else ConfidenceLevel.LOW,
-                ) if page else None,
+                    confidence_score=confidence if value and confidence is not None else 0.0,
+                    confidence_level=confidence_level,
+                ) if (page is not None or confidence is not None) else None,
                 sensitivity=SensitivityTier.CONFIDENTIAL,
+                is_cde=schema_field.is_cde,
+                info_classification=schema_field.info_classification,
+                pii_classification=schema_field.pii_classification,
             ))
     except Exception as e:
-        print(f"  [Lens] CBE parse error: {e}")
+        print(f"  [Lens] CDE parse error: {e}")
         print(f"  [Lens] Raw response: {response[:300]}")
 
     return facts
@@ -349,20 +491,19 @@ FULL DOCUMENT TEXT:
     return parties
 
 
-def extract_obligations(full_text: str) -> list[RiskObligation]:
-    """Extract key covenants and obligations from the full document."""
-    prompt = f"""From this financial document, extract the most important covenants and obligations.
-Focus on: financial covenants, reporting requirements, events of default triggers,
-payment obligations, and any unusual restrictions.
+def extract_obligations(full_text: str, doc_type: DocumentType) -> list[RiskObligation]:
+    """Extract key obligations, commitments, and requirements from the full document."""
+    prompt = f"""From this {doc_type.value} document, extract up to 15 key obligations, commitments, or requirements — whatever is material for this document type.
 
-Extract maximum 15 items.
+Focus on: conditions, requirements, reporting duties, payment obligations,
+restrictions on the parties, triggers that activate consequences, and binding commitments.
 
 Respond ONLY with JSON array, no markdown:
 [
   {{
-    "type": "financial_covenant",
-    "description": "Debt Service Coverage Ratio must not fall below 1.20:1.00",
-    "trigger": "DSCR below 1.20:1.00",
+    "type": "reporting",
+    "description": "Borrower must deliver audited financial statements within 120 days of fiscal year end",
+    "trigger": "Annual fiscal year end",
     "party": "Borrower"
   }}
 ]
@@ -376,7 +517,7 @@ FULL DOCUMENT TEXT:
         items = json.loads(clean_json(response))
         for item in items:
             obligations.append(RiskObligation(
-                obligation_type=item.get("type", "covenant"),
+                obligation_type=item.get("type", "obligation"),
                 description=item.get("description", ""),
                 trigger_language=item.get("trigger"),
                 party_responsible=item.get("party"),
@@ -462,7 +603,7 @@ def extract_key_dates(full_text: str, page_texts: list[str]) -> list[ExtractedFa
             role = "payment_due_date"
         elif any(w in context for w in ["closing"]):
             role = "closing_date"
-        elif any(w in context for w in ["publish", "filed", "printed", "4/11/26"]):
+        elif any(w in context for w in ["publish", "filed", "printed"]):
             role = "publication_date"
         else:
             role = "date"
@@ -489,52 +630,73 @@ def extract_key_dates(full_text: str, page_texts: list[str]) -> list[ExtractedFa
     return dates[:25]
 
 
-def generate_executive_summary(full_text: str, cbes: list[ExtractedFact]) -> str:
-    cbe_context = "\n".join([
-        f"- {f.field_name}: {f.value}"
-        for f in cbes if f.value
-    ])
+def generate_executive_summary(
+    full_text: str,
+    cdes: list[ExtractedFact],
+    doc_type: DocumentType,
+) -> str:
+    config = _get_doc_config(doc_type)
+    perspective = config["perspective"]
+    sections = config["summary_sections"]
 
-    prompt = f"""You are a senior financial analyst at a major US bank.
-Write a detailed executive summary of this financial document for senior leadership.
+    cde_context = "\n".join(
+        f"- {f.field_name}: {f.value}"
+        for f in cdes if f.value
+    )
+
+    if sections:
+        section_instruction = (
+            "Cover these key areas:\n" +
+            "\n".join(f"{i+1}. {s}" for i, s in enumerate(sections))
+        )
+    else:
+        section_instruction = (
+            "Structure the summary around the most important aspects of this document. "
+            "Let the content guide the structure."
+        )
+
+    prompt = f"""You are a {perspective} at a major financial institution.
+Write a professional executive summary of this document for senior leadership.
 
 EXTRACTED KEY FACTS:
-{cbe_context}
+{cde_context}
 
 DOCUMENT (first 6000 characters for context):
 {full_text[:6000]}
 
-Write a professional executive summary (400-500 words) covering:
-1. What this document is and who the parties are
-2. The loan amount, type, and key financial terms
-3. The collateral and security arrangement
-4. Key dates (effective, maturity)
-5. Key covenants and obligations
-6. Any notable or unusual terms
-7. Overall risk profile observation
+Write an executive summary (400-500 words).
+{section_instruction}
 
-Be precise. Use exact numbers from the extracted facts.
-Never invent details not present in the document."""
+Be precise. Use exact values from the extracted facts.
+Only state what is explicitly in the document. Never invent details."""
 
     return call_llm(prompt)
 
 
-def generate_detailed_summary(full_text: str) -> str:
-    prompt = f"""You are a senior associate at a law firm specialising in commercial lending.
-Write a detailed deal memo for this financial document.
+def generate_detailed_summary(full_text: str, doc_type: DocumentType) -> str:
+    config = _get_doc_config(doc_type)
+    perspective = config["perspective"]
+    sections = config["summary_sections"]
+
+    if sections:
+        section_instruction = (
+            "Organise the summary with these sections:\n" +
+            "\n".join(f"{i+1}. {s}" for i, s in enumerate(sections))
+        )
+    else:
+        section_instruction = (
+            "Organise the summary with sections appropriate for this document type. "
+            "Use the content to guide the structure."
+        )
+
+    prompt = f"""You are a {perspective} at a major financial institution.
+Write a detailed summary of this document.
 
 DOCUMENT TEXT (first 12000 characters):
 {full_text[:12000]}
 
-Write a comprehensive summary (700-900 words) organised by:
-1. Transaction Overview
-2. Parties and Roles
-3. Financial Terms (amount, rate, fees, repayment schedule)
-4. Collateral and Security
-5. Key Covenants (financial and operational)
-6. Events of Default (key triggers)
-7. Governing Law and Jurisdiction
-8. Notable or Unusual Provisions
+Write a comprehensive summary (700-900 words).
+{section_instruction}
 
 Only state what is explicitly in the document.
 If a section is not covered in the reviewed text, state that clearly."""
@@ -553,7 +715,7 @@ def generate_page_summaries(page_texts: list[str], max_pages: int = 15) -> list[
             })
             continue
 
-        prompt = f"""Summarise page {i+1} of this financial document in 2-3 sentences.
+        prompt = f"""Summarise page {i+1} of this document in 2-3 sentences.
 List any key entities (names, amounts, dates) found.
 
 PAGE TEXT:
@@ -584,8 +746,11 @@ ENTITIES: [comma-separated list, or 'None']"""
     return summaries
 
 
-def generate_free_narrative(full_text: str) -> str:
-    prompt = f"""You are reviewing this financial document as a Chief Risk Officer.
+def generate_free_narrative(full_text: str, doc_type: DocumentType) -> str:
+    config = _get_doc_config(doc_type)
+    perspective = config["perspective"]
+
+    prompt = f"""You are reviewing this document as a {perspective}.
 Write a free-form narrative of everything important, unusual, or worth flagging —
 things a standard data extraction template might miss.
 
@@ -622,8 +787,8 @@ Look for things like:
 - Cross-default triggers
 - Escrow requirements
 - Reporting deadlines and frequencies
-- Borrower restrictions
-- Lender powers
+- Party restrictions and limitations
+- Powers and remedies
 - Threshold amounts and percentages
 - Waiver and consent requirements
 - Any unusual clauses
@@ -640,7 +805,7 @@ Respond ONLY with JSON array, no markdown:
     "field": "prepayment_minimum",
     "value": "$1,000,000 minimum per prepayment",
     "business_definition": "The minimum amount that must be repaid in any single voluntary prepayment transaction.",
-    "importance": "Limits borrower ability to make small ad-hoc principal reductions"
+    "importance": "Limits ability to make small ad-hoc principal reductions"
   }}
 ]
 
@@ -678,45 +843,161 @@ FULL DOCUMENT TEXT:
 
 # ─────────────────────────────────────────────
 # HEALTH SCORE
+# Four dimensions, schema-driven, no hardcoded field names.
 # ─────────────────────────────────────────────
 
-def compute_document_health(cbes: list[ExtractedFact]) -> tuple[float, dict]:
-    found = sum(
-        1 for f in cbes
-        if f.value and f.field_name in CORE_HEALTH_FIELDS
+def compute_document_health(
+    cdes: list[ExtractedFact],
+    discovered_schema: list[DiscoveredField],
+) -> tuple[float, dict, dict]:
+    """
+    Compute four-dimension document health score.
+    Returns (composite_score_0_100, health_breakdown_dict, counts_dict)
+
+    Dimensions:
+      a) CDE Core Completeness  — weight 0.40
+      b) Provenance Integrity   — weight 0.30
+      c) Extraction Confidence  — weight 0.20
+      d) Value Validity Rate    — weight 0.10
+    """
+    schema_map = {f.field_name: f for f in discovered_schema}
+    core_fields = [f for f in discovered_schema if f.is_core_field]
+    core_field_names = {f.field_name for f in core_fields}
+    cdes_with_value = [f for f in cdes if f.value is not None]
+
+    # ── a) CDE Core Completeness (weight 0.40) ──────────────
+    core_cdes_expected = len(core_fields)
+    core_cdes_found = sum(
+        1 for f in cdes_with_value
+        if f.field_name in core_field_names
     )
-    completeness = (found / len(CORE_HEALTH_FIELDS)) * 100
+    core_completeness = (
+        core_cdes_found / core_cdes_expected
+        if core_cdes_expected > 0 else 0.0
+    )
 
-    provenance_score = (
-        sum(1 for f in cbes if f.value and f.provenance and f.provenance.page) /
-        max(sum(1 for f in cbes if f.value), 1)
-    ) * 100
+    # ── b) Provenance Integrity (weight 0.30) ───────────────
+    cdes_with_raw = sum(1 for f in cdes_with_value if f.raw_text is not None)
+    provenance_integrity = (
+        cdes_with_raw / len(cdes_with_value)
+        if cdes_with_value else 0.0
+    )
 
-    confidence_score = (
-        sum(
-            f.provenance.confidence_score
-            for f in cbes
-            if f.value and f.provenance and f.provenance.confidence_score
-        ) /
-        max(sum(1 for f in cbes if f.value), 1)
-    ) * 100
+    # ── c) Extraction Confidence (weight 0.20) ──────────────
+    confidence_scores = [
+        f.provenance.confidence_score
+        for f in cdes_with_value
+        if f.provenance and f.provenance.confidence_score is not None
+        and f.provenance.confidence_score > 0
+    ]
+    avg_confidence = (
+        sum(confidence_scores) / len(confidence_scores)
+        if confidence_scores else 0.0
+    )
+
+    # ── d) Value Validity Rate (weight 0.10) ────────────────
+    valid_count = 0
+    for f in cdes_with_value:
+        schema_field = schema_map.get(f.field_name)
+        sem_type = schema_field.semantic_type if schema_field else "string"
+        if validate_extracted_value(f.value, sem_type):
+            valid_count += 1
+    validity_rate = valid_count / len(cdes_with_value) if cdes_with_value else 0.0
 
     health = (
-        completeness      * 0.50 +
-        provenance_score  * 0.25 +
-        confidence_score  * 0.25
-    )
+        core_completeness    * 0.40 +
+        provenance_integrity * 0.30 +
+        avg_confidence       * 0.20 +
+        validity_rate        * 0.10
+    ) * 100
 
-    return round(health, 2), {
-        "completeness":        round(completeness, 2),
-        "provenance_coverage": round(provenance_score, 2),
-        "avg_confidence":      round(confidence_score, 2),
+    breakdown = {
+        "CDE Core Completeness": round(core_completeness * 100, 2),
+        "Provenance Integrity":  round(provenance_integrity * 100, 2),
+        "Extraction Confidence": round(avg_confidence * 100, 2),
+        "Value Validity Rate":   round(validity_rate * 100, 2),
     }
+
+    counts = {
+        "core_cdes_found":     core_cdes_found,
+        "core_cdes_expected":  core_cdes_expected,
+        "total_cdes_found":    len(cdes_with_value),
+        "total_cdes_expected": len(discovered_schema),
+    }
+
+    return round(health, 2), breakdown, counts
 
 
 # ─────────────────────────────────────────────
 # MAIN PROFILER
 # ─────────────────────────────────────────────
+
+def extract_text_from_docx(path: Path) -> tuple[list[str], dict]:
+    """
+    Extract text and fingerprint from a .docx file.
+    Returns (page_texts, fingerprint_dict) in the same shape as the PDF path,
+    so everything downstream runs unchanged.
+    DOCX has no real page boundaries — content is chunked at ~3 000 chars each.
+    """
+    from docx import Document as DocxDocument
+
+    doc = DocxDocument(str(path))
+
+    # Paragraphs (preserving heading text for section detection)
+    lines: list[str] = []
+    sections: list[str] = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+        lines.append(text)
+        if para.style.name.startswith("Heading") and len(sections) < 20:
+            s = text[:80]
+            if s not in sections:
+                sections.append(s)
+
+    # Table cell text
+    has_tables = len(doc.tables) > 0
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                cell_text = cell.text.strip()
+                if cell_text:
+                    lines.append(cell_text)
+
+    full_text = "\n".join(lines)
+
+    # Chunk into approximate pages (~3 000 chars)
+    page_texts: list[str] = []
+    chunk: list[str] = []
+    chunk_len = 0
+    for line in lines:
+        chunk.append(line)
+        chunk_len += len(line) + 1
+        if chunk_len >= 3000:
+            page_texts.append("\n".join(chunk))
+            chunk = []
+            chunk_len = 0
+    if chunk:
+        page_texts.append("\n".join(chunk))
+    if not page_texts:
+        page_texts = [""]
+
+    sample_text = full_text[:3000]
+    doc_type, confidence = classify_document(sample_text)
+
+    fingerprint = {
+        "page_count": len(page_texts),
+        "doc_type": doc_type,
+        "doc_type_confidence": confidence,
+        "sections_detected": sections,
+        "has_tables": has_tables,
+        "is_scanned": False,
+        "sample_text": sample_text,
+    }
+
+    return page_texts, fingerprint
+
 
 def extract_text_with_ocr(pdf_path: Path) -> list[str]:
     """
@@ -758,6 +1039,7 @@ def extract_text_with_ocr(pdf_path: Path) -> list[str]:
         print(f"  [Lens] OCR failed: {e}")
         return []
 
+
 def profile_unstructured(
     file_path: str | Path,
     include_page_summaries: bool = False,
@@ -765,45 +1047,59 @@ def profile_unstructured(
     """
     Main entry point. Takes any PDF path.
     Returns a fully populated ProfileContract.
-    No hardcoding. Works for any document type.
+    Schema-driven extraction — no hardcoding. Works for any document type.
     """
     path = Path(file_path)
 
-    with pdfplumber.open(path) as pdf:
-
-        print("  [Lens] Layer 1: Document fingerprint...")
-        fingerprint = extract_fingerprint(pdf, path)
-
-        print("  [Lens] Extracting text from all pages...")
-        page_texts = [page.extract_text() or "" for page in pdf.pages]
+    # ── Format-specific text extraction ───────────────────
+    if path.suffix.lower() == ".docx":
+        print("  [Lens] Layer 1: DOCX fingerprint (python-docx)...")
+        page_texts, fingerprint = extract_text_from_docx(path)
         full_text = "\n".join(page_texts)
+        print(f"  [Lens] Document: {len(full_text):,} chars across "
+              f"{len(page_texts)} chunks")
+    else:
+        with pdfplumber.open(path) as pdf:
+            print("  [Lens] Layer 1: Document fingerprint...")
+            fingerprint = extract_fingerprint(pdf, path)
 
-        # ── OCR fallback for scanned PDFs ─────
-        total_text_length = sum(len(t) for t in page_texts)
-        if total_text_length < 500:
-            print("  [Lens] Minimal text detected — trying OCR...")
-            ocr_texts = extract_text_with_ocr(path)
-            if ocr_texts and sum(len(t) for t in ocr_texts) > total_text_length:
-                print("  [Lens] OCR produced better results — using OCR text")
-                page_texts = ocr_texts
-                full_text = "\n".join(page_texts)
-                fingerprint["is_scanned"] = True
-            else:
-                print("  [Lens] OCR did not improve extraction — using original")
+            print("  [Lens] Extracting text from all pages...")
+            page_texts = [page.extract_text() or "" for page in pdf.pages]
+            full_text = "\n".join(page_texts)
+
+            # OCR fallback for scanned PDFs
+            total_text_length = sum(len(t) for t in page_texts)
+            if total_text_length < 500:
+                print("  [Lens] Minimal text detected — trying OCR...")
+                ocr_texts = extract_text_with_ocr(path)
+                if ocr_texts and sum(len(t) for t in ocr_texts) > total_text_length:
+                    print("  [Lens] OCR produced better results — using OCR text")
+                    page_texts = ocr_texts
+                    full_text = "\n".join(page_texts)
+                    fingerprint["is_scanned"] = True
+                else:
+                    print("  [Lens] OCR did not improve extraction — using original")
 
         print(f"  [Lens] Document: {len(full_text):,} chars — "
               f"sending up to {MAX_CHARS:,} chars per LLM call")
 
+        print("  [Lens] Layer 1.5: Schema discovery...")
+        discovered_schema = discover_extraction_schema(
+            fingerprint["doc_type"],
+            full_text,
+        )
+        print(f"  [Lens]   Discovered {len(discovered_schema)} fields to extract")
+
         print("  [Lens] Layer 2: LLM extraction (Groq / Llama 4 Scout 17B)...")
 
-        print("  [Lens]   Extracting critical business elements + data dictionary...")
-        cbes = extract_cbes(full_text)
+        print("  [Lens]   Extracting critical data elements...")
+        cdes = extract_cdes(full_text, discovered_schema)
 
         print("  [Lens]   Extracting parties...")
         parties = extract_parties(full_text)
 
         print("  [Lens]   Extracting obligations and covenants...")
-        obligations = extract_obligations(full_text)
+        obligations = extract_obligations(full_text, fingerprint["doc_type"])
 
         print("  [Lens]   Extracting monetary amounts...")
         monetary_amounts = extract_monetary_amounts(full_text, page_texts)
@@ -812,10 +1108,10 @@ def profile_unstructured(
         key_dates = extract_key_dates(full_text, page_texts)
 
         print("  [Lens]   Generating executive summary...")
-        executive = generate_executive_summary(full_text, cbes)
+        executive = generate_executive_summary(full_text, cdes, fingerprint["doc_type"])
 
         print("  [Lens]   Generating detailed summary...")
-        detailed = generate_detailed_summary(full_text)
+        detailed = generate_detailed_summary(full_text, fingerprint["doc_type"])
 
         page_summaries = []
         if include_page_summaries:
@@ -823,30 +1119,24 @@ def profile_unstructured(
             page_summaries = generate_page_summaries(page_texts)
 
         print("  [Lens]   Generating free narrative...")
-        narrative = generate_free_narrative(full_text)
+        narrative = generate_free_narrative(full_text, fingerprint["doc_type"])
 
-        found_fields = [f.field_name for f in cbes if f.value]
+        found_fields = [f.field_name for f in cdes if f.value]
         found_fields += [f.field_name for f in parties if f.value]
 
         print("  [Lens]   Hunting for additional findings...")
         additional = extract_additional_findings(full_text, found_fields)
-        
+
         # ── Deduplicate additional findings ──────
-        # Remove anything from additional_findings that duplicates a CBE field
-        cbe_field_names = {f.field_name.lower() for f in cbes if f.value}
-        cbe_values = {str(f.value).lower().strip() for f in cbes if f.value}
+        cde_field_names = {f.field_name.lower() for f in cdes if f.value}
+        cde_values = {str(f.value).lower().strip() for f in cdes if f.value}
         additional = [
             f for f in additional
-            if f.field_name.lower() not in cbe_field_names
-            and str(f.value or "").lower().strip() not in cbe_values
+            if f.field_name.lower() not in cde_field_names
+            and str(f.value or "").lower().strip() not in cde_values
         ]
 
-        health, breakdown = compute_document_health(cbes)
-
-        found_count = sum(
-            1 for f in cbes
-            if f.value and f.field_name in CORE_HEALTH_FIELDS
-        )
+        health, breakdown, counts = compute_document_health(cdes, discovered_schema)
 
         audit_log = [{
             "timestamp": datetime.utcnow().isoformat(),
@@ -854,7 +1144,7 @@ def profile_unstructured(
             "detail": (
                 f"Profiled {path.name} — "
                 f"{fingerprint['page_count']} pages — "
-                f"{len(cbes)} CBEs — "
+                f"{counts['total_cdes_found']}/{counts['total_cdes_expected']} CDEs found — "
                 f"{len(additional)} additional findings — "
                 f"via Groq/Llama-4-Scout-17B"
             ),
@@ -875,12 +1165,15 @@ def profile_unstructured(
             sections_detected=fingerprint["sections_detected"],
             health_score=health,
             health_breakdown=breakdown,
-            completeness_score=round(
-                (found_count / len(CORE_HEALTH_FIELDS)) * 100, 2
-            ),
-            expected_fields_count=len(CORE_HEALTH_FIELDS),
-            found_fields_count=found_count,
-            critical_business_elements=cbes,
+            completeness_score=round(breakdown["CDE Core Completeness"], 2),
+            expected_fields_count=counts["total_cdes_expected"],
+            found_fields_count=counts["total_cdes_found"],
+            extraction_schema=discovered_schema,
+            critical_data_elements=cdes,
+            core_cdes_found=counts["core_cdes_found"],
+            core_cdes_expected=counts["core_cdes_expected"],
+            total_cdes_found=counts["total_cdes_found"],
+            total_cdes_expected=counts["total_cdes_expected"],
             summary=DocumentSummary(
                 executive=executive,
                 detailed=detailed,
@@ -892,8 +1185,7 @@ def profile_unstructured(
             key_dates=key_dates,
             additional_findings=additional,
             raw_llm_narrative=narrative,
-            # Store truncated page texts so on-demand per-page summaries work
-            # even after the uploaded PDF has been deleted.
+            # Truncated page texts for on-demand per-page summaries
             page_texts=[t[:4000] for t in page_texts],
             audit_log=audit_log,
             llm_used="llama-4-scout-17b",

@@ -8,7 +8,7 @@ This is what makes Lens a platform, not three separate tools.
 
 from __future__ import annotations
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
 
@@ -57,6 +57,17 @@ class ConfidenceLevel(str, Enum):
 # BUILDING BLOCKS
 # ─────────────────────────────────────────────
 
+class DiscoveredField(BaseModel):
+    """A single field discovered during schema discovery (Layer 1.5)."""
+    field_name: str
+    description: str
+    semantic_type: str  # date / currency / percentage / entity_name / string / boolean
+    is_cde: bool = False
+    is_core_field: bool = False
+    info_classification: Literal["Public", "Internal", "Confidential", "Restricted"] = "Internal"
+    pii_classification: Literal["PII", "Sensitive", "Non-PII"] = "Non-PII"
+
+
 class ProvenanceSpan(BaseModel):
     """Every extracted fact carries this. No exceptions. SR 11-7."""
     page: int | None = None
@@ -83,8 +94,12 @@ class ExtractedFact(BaseModel):
     value: Any | None = None                  # None = not found, never hallucinated
     raw_text: str | None = None               # The exact text it was pulled from
     not_found_reason: str | None = None       # "section not present" / "value not stated"
+    confidence_rationale: str | None = None  # LLM self-assessment of confidence
     provenance: ProvenanceSpan | None = None
     sensitivity: SensitivityTier = SensitivityTier.INTERNAL
+    is_cde: bool = False
+    info_classification: Literal["Public", "Internal", "Confidential", "Restricted"] = "Internal"
+    pii_classification: Literal["PII", "Sensitive", "Non-PII"] = "Non-PII"
 
 
 class ColumnProfile(BaseModel):
@@ -198,6 +213,9 @@ class RiskObligation(BaseModel):
     party_responsible: str | None = None
     trigger_language: str | None = None      # "material adverse change", "event of default"
     provenance: ProvenanceSpan | None = None
+    is_cde: bool = False
+    info_classification: Literal["Public", "Internal", "Confidential", "Restricted"] = "Internal"
+    pii_classification: Literal["PII", "Sensitive", "Non-PII"] = "Non-PII"
 
 
 class DriftAlert(BaseModel):
@@ -265,8 +283,17 @@ class ProfileContract(BaseModel):
     expected_fields_count: int | None = None
     found_fields_count: int | None = None
 
-    # ── Critical Business Elements ────────────
-    critical_business_elements: list[ExtractedFact] = []
+    # ── Extraction schema (discovered by Layer 1.5) ────────
+    extraction_schema: list[DiscoveredField] = []
+
+    # ── Critical Data Elements ─────────────────────────────
+    critical_data_elements: list[ExtractedFact] = []
+
+    # ── CDE counts ────────────────────────────────────────
+    core_cdes_found: int | None = None
+    core_cdes_expected: int | None = None
+    total_cdes_found: int | None = None
+    total_cdes_expected: int | None = None
 
     # ── Summary (unstructured) ────────────────
     summary: DocumentSummary | None = None

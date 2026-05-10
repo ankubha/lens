@@ -42,12 +42,26 @@ export interface ExtractedFact {
   value?: string
   raw_text?: string
   not_found_reason?: string
+  confidence_rationale?: string
   provenance?: {
     page?: number
     confidence_score?: number
     confidence_level?: string
   }
   sensitivity?: string
+  is_cde?: boolean
+  info_classification?: 'Public' | 'Internal' | 'Confidential' | 'Restricted'
+  pii_classification?: 'PII' | 'Sensitive' | 'Non-PII'
+}
+
+export interface DiscoveredField {
+  field_name: string
+  description: string
+  semantic_type: string
+  is_cde: boolean
+  is_core_field: boolean
+  info_classification: 'Public' | 'Internal' | 'Confidential' | 'Restricted'
+  pii_classification: 'PII' | 'Sensitive' | 'Non-PII'
 }
 
 export interface ColumnProfile {
@@ -160,7 +174,12 @@ export interface ProfileContract {
   expected_fields_count?: number
   found_fields_count?: number
   // Content
-  critical_business_elements?: ExtractedFact[]
+  extraction_schema?: DiscoveredField[]
+  critical_data_elements?: ExtractedFact[]
+  core_cdes_found?: number
+  core_cdes_expected?: number
+  total_cdes_found?: number
+  total_cdes_expected?: number
   summary?: {
     executive?: string
     detailed?: string

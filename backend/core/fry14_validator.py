@@ -746,7 +746,7 @@ def validate_against_schedule_h(profile_dict: dict) -> list[ValidationResult]:
 
     # ── Collect all extracted facts ───────────────────────
     all_facts = []
-    for fact in profile_dict.get("critical_business_elements", []):
+    for fact in profile_dict.get("critical_data_elements", []):
         if fact.get("value"):
             all_facts.append(fact)
     for fact in profile_dict.get("additional_findings", []):
