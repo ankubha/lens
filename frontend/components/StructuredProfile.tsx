@@ -172,7 +172,7 @@ function WordCloud({ profileId, columnName }: { profileId: string; columnName: s
       <img
         src={src}
         alt={`Word cloud — ${columnName}`}
-        style={{ width: '100%', height: 'auto', borderRadius: 6, display: 'block' }}
+        style={{ maxWidth: 380, width: '100%', height: 'auto', borderRadius: 6, display: 'block', margin: '0 auto' }}
         onError={() => setFailed(true)}
       />
     </div>
@@ -965,7 +965,7 @@ function VariablesTab({ profile, selectedCol, setSelectedCol }: {
                       key={chartSrc}
                       src={chartSrc}
                       alt={`DateTime chart — ${col.column_name}`}
-                      style={{ width: '100%', height: 'auto', display: 'block', borderRadius: 4 }}
+                      style={{ maxWidth: 480, width: '100%', height: 'auto', display: 'block', borderRadius: 4, margin: '0 auto' }}
                     />
                   </div>
                 </Card>
@@ -1260,7 +1260,7 @@ export default function StructuredProfile({ profile, activeTab }: Props) {
                   <XAxis dataKey="name" tick={{ fontSize: 10, fill: '#8A8A8A' }} axisLine={false} tickLine={false} angle={-35} textAnchor="end" interval={0} />
                   <YAxis domain={[0, 1]} tick={{ fontSize: 10, fill: '#8A8A8A' }} axisLine={false} tickLine={false} tickFormatter={v => v.toFixed(1)} label={{ value: 'Completion (0–1)', angle: -90, position: 'insideLeft', fontSize: 11, fill: '#8A8A8A', offset: -10 }} />
                   <Tooltip formatter={(v: any, _: any, props: any) => [`${props.payload.nonNull.toLocaleString()} non-null (${(Number(v) * 100).toFixed(1)}%)`, 'Completion']} contentStyle={{ fontSize: 12, border: '0.5px solid var(--border-1)', borderRadius: 8 }} />
-                  <Bar dataKey="completion" radius={[3, 3, 0, 0]} label={{ position: 'top', formatter: (v: any, entry: any) => entry?.nonNull?.toLocaleString?.() ?? '', fontSize: 9, fill: '#6B7280' }}>
+                  <Bar dataKey="completion" radius={[3, 3, 0, 0]} label={{ position: 'top', formatter: (v: any) => v != null ? (Number(v) * 100).toFixed(0) + '%' : '', fontSize: 9, fill: '#6B7280' }}>
                     {countData.map((d, i) => (
                       <Cell key={i} fill={d.completion < 0.8 ? '#DC2626' : d.completion < 0.95 ? '#CA8A04' : '#16A34A'} />
                     ))}
@@ -1315,7 +1315,7 @@ export default function StructuredProfile({ profile, activeTab }: Props) {
               <img
                 src={`${API_BASE}/api/profiles/${profile.profile_id}/missing_heatmap`}
                 alt="Missing value correlation heatmap"
-                style={{ width: '100%', height: 'auto', display: 'block', borderRadius: 4 }}
+                style={{ maxWidth: 520, width: '100%', height: 'auto', display: 'block', borderRadius: 4, margin: '0 auto' }}
               />
             </div>
           </Card>
@@ -1369,7 +1369,7 @@ export default function StructuredProfile({ profile, activeTab }: Props) {
               <img
                 src={`${API_BASE}/api/profiles/${profile.profile_id}/correlation_heatmap`}
                 alt="Pearson correlation heatmap"
-                style={{ width: '100%', height: 'auto', display: 'block', borderRadius: 4 }}
+                style={{ maxWidth: 520, width: '100%', height: 'auto', display: 'block', borderRadius: 4, margin: '0 auto' }}
               />
             </div>
           </Card>
@@ -1458,7 +1458,7 @@ export default function StructuredProfile({ profile, activeTab }: Props) {
               key={hexbinSrc}
               src={hexbinSrc}
               alt={`Hexbin: ${xName} × ${yName}`}
-              style={{ width: '100%', height: 'auto', display: 'block', borderRadius: 4 }}
+              style={{ maxWidth: 480, width: '100%', height: 'auto', display: 'block', borderRadius: 4, margin: '0 auto' }}
             />
           </div>
         </Card>

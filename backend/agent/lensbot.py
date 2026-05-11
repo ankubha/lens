@@ -1,325 +1,312 @@
 """
-Lens — LensBot Agent
-====================
-LangGraph-powered agent for answering questions about profiled data.
-Anti-hallucination: only answers from profile data, never invents.
-Every answer cites its source.
+Lens — LensBot  (Pure Numpy Semantic Vector Search)
+====================================================
+Architecture:
+  1. Chunking   — profile split into meaningful text units.
+  2. Embedding  — TF-IDF vectors projected to 384-d via stable random
+                  projection (numpy only — zero extra dependencies).
+  3. Vector store — in-memory numpy arrays keyed by profile_id.
+                  No ChromaDB, no onnxruntime, no DLL loading.
+  4. Retrieval  — brute-force cosine similarity (dot product on unit
+                  vectors) finds top-K nearest chunks. Fast for < 500 chunks.
+  5. Synthesis  — Groq / Llama-4 answers strictly from retrieved chunks.
 """
 
 from __future__ import annotations
-import os
-import json
-from typing import Annotated, TypedDict, Literal
+import os, json, re, math
+from collections import Counter
 from dotenv import load_dotenv
-
 from groq import Groq
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
+
+import numpy as np
 
 from backend.models.profile_contract import ProfileContract
 
 load_dotenv()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-LLM_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+LLM_MODEL   = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+EMBED_DIM = 384
+
+# ── Pure-numpy in-memory vector store ───────────────────────────────
+# { profile_id: {"embs": np.ndarray(N,384), "chunks": list[dict], "vec": _Vectorizer} }
+_store: dict[str, dict] = {}
 
 
 # ─────────────────────────────────────────────
-# STATE
+# VECTORIZER  — TF-IDF + Random Projection
+# Pure numpy. Fit on corpus, reused for query.
 # ─────────────────────────────────────────────
 
-class AgentState(TypedDict):
-    messages:        Annotated[list, add_messages]
-    profile:         dict
-    tool_results:    list[dict]
-    final_answer:    str
-    citations:       list[str]
-
-
-# ─────────────────────────────────────────────
-# TOOLS
-# ─────────────────────────────────────────────
-
-def tool_search_profile(profile: dict, query: str) -> dict:
+class _Vectorizer:
     """
-    Search the structured profile for relevant fields.
-    Returns matching CBEs, columns, health metrics, findings.
+    Fit on a set of documents, then transform any text to a
+    384-d unit vector via TF-IDF + stable random projection.
+    Uses only numpy + stdlib — no onnxruntime, no PyTorch, no ChromaDB.
     """
-    query_lower = query.lower()
-    results = {}
 
+    def __init__(self, dim: int = EMBED_DIM):
+        self._dim   = dim
+        self._vocab: dict[str, int]   = {}
+        self._idf:   dict[str, float] = {}
+        self._proj:  np.ndarray | None = None   # (vocab_size, dim)
+
+    @staticmethod
+    def _tok(text: str) -> list[str]:
+        return re.findall(r"[a-z0-9]+", text.lower())
+
+    def fit_transform(self, texts: list[str]) -> np.ndarray:
+        """Fit vocabulary on corpus; return (N, dim) unit-vector matrix."""
+        N = len(texts)
+        tokenized = [self._tok(t) for t in texts]
+
+        df: Counter = Counter()
+        for toks in tokenized:
+            df.update(set(toks))
+
+        self._idf = {t: math.log((N + 1) / (f + 1)) + 1 for t, f in df.items()}
+
+        vocab_terms = sorted(self._idf, key=lambda t: -self._idf[t])
+        self._vocab = {t: i for i, t in enumerate(vocab_terms)}
+        V = len(self._vocab)
+
+        rng = np.random.RandomState(42)
+        self._proj = rng.randn(V, self._dim).astype(np.float32)
+        col_norms  = np.linalg.norm(self._proj, axis=0, keepdims=True)
+        col_norms[col_norms == 0] = 1
+        self._proj /= col_norms
+
+        return self._tfidf_and_project(tokenized, N, V)
+
+    def transform(self, texts: list[str]) -> np.ndarray:
+        """Transform new texts using the fitted vocabulary."""
+        tokenized = [self._tok(t) for t in texts]
+        return self._tfidf_and_project(tokenized, len(texts), len(self._vocab))
+
+    def _tfidf_and_project(self, tokenized: list[list[str]],
+                            n: int, V: int) -> np.ndarray:
+        mat = np.zeros((n, V), dtype=np.float32)
+        for i, toks in enumerate(tokenized):
+            total = max(len(toks), 1)
+            tf = Counter(toks)
+            for term, cnt in tf.items():
+                if term in self._vocab:
+                    j = self._vocab[term]
+                    mat[i, j] = (cnt / total) * self._idf.get(term, 1.0)
+
+        proj = mat @ self._proj            # (n, dim)
+        norms = np.linalg.norm(proj, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        return (proj / norms).astype(np.float32)
+
+
+# ─────────────────────────────────────────────
+# PROFILE → CHUNKS
+# ─────────────────────────────────────────────
+
+def _build_chunks(profile: dict) -> list[dict]:
+    chunks: list[dict] = []
     modality = profile.get("modality", "")
+    filename = profile.get("filename", "document")
 
-    # Health score
-    if any(w in query_lower for w in ["health", "score", "quality"]):
-        results["health_score"] = profile.get("health_score")
-        results["health_breakdown"] = profile.get("health_breakdown")
+    def add(text: str, section: str, **meta):
+        t = (text or "").strip()
+        if t:
+            chunks.append({"text": t,
+                            "metadata": {"section": section,
+                                         "modality": str(modality), **meta}})
 
-    # Structured — column search
-    if modality == "structured":
-        cols = profile.get("columns", [])
-        matching_cols = [
-            c for c in cols
-            if (query_lower in c.get("column_name", "").lower() or
-                query_lower in (c.get("semantic_type") or "").lower() or
-                any(w in query_lower for w in ["missing", "null"]) and c.get("missing_pct", 0) > 0 or
-                any(w in query_lower for w in ["pii", "sensitive", "personal"]) and c.get("is_pii") or
-                any(w in query_lower for w in ["column", "field", "all"]))
-        ]
-        if matching_cols:
-            results["columns"] = matching_cols[:10]
+    # Health
+    bd = profile.get("health_breakdown") or {}
+    add(f"Health score: {profile.get('health_score')}/100. Breakdown: {json.dumps(bd)}", "health")
 
-        # Stats
-        if any(w in query_lower for w in ["row", "record", "count", "size", "dimension"]):
-            results["row_count"] = profile.get("row_count")
-            results["column_count"] = profile.get("column_count")
-            results["duplicate_row_count"] = profile.get("duplicate_row_count")
+    # ── STRUCTURED ──────────────────────────────────────────
+    if str(modality) in ("structured", "DataModality.STRUCTURED"):
+        add(f"Dataset '{filename}': {profile.get('row_count')} rows, "
+            f"{profile.get('column_count')} columns, "
+            f"{profile.get('duplicate_row_count', 0)} duplicates. "
+            f"Health {profile.get('health_score')}.", "overview")
 
-        # Drift
-        if any(w in query_lower for w in ["drift", "change", "shift"]):
-            results["drift_alerts"] = profile.get("drift_alerts", [])
+        for col in profile.get("columns", []):
+            p = [f"Column '{col['column_name']}' type {col.get('var_type')} ({col.get('data_type')})"]
+            if col.get("business_definition"): p.append(col["business_definition"])
+            if col.get("semantic_type"):       p.append(f"Semantic type: {col['semantic_type']}")
+            if col.get("is_pii"):              p.append("Contains PII personal sensitive data")
+            if col.get("sensitivity"):         p.append(f"Sensitivity: {col['sensitivity']}")
+            mp = col.get("missing_pct") or 0
+            if mp > 0: p.append(f"Missing: {mp}% ({col.get('missing_count')} nulls)")
+            if col.get("mean") is not None:
+                p.append(f"Mean {col['mean']} Min {col['min']} Max {col['max']} "
+                         f"StdDev {col.get('std_dev')} Median {col.get('median')}")
+            if col.get("unique_count"):
+                p.append(f"Unique values: {col['unique_count']} ({col.get('unique_pct')}%)")
+            if col.get("top_values"):
+                p.append("Top values: " +
+                         ", ".join(str(v.get("value")) for v in col["top_values"][:5]))
+            if col.get("completeness_score") is not None:
+                p.append(f"Completeness: {col['completeness_score']}%")
+            add(" | ".join(p), "column", field=str(col["column_name"]))
 
-        # Cross-column intelligence
-        if any(w in query_lower for w in ["primary key", "join", "dependency", "intelligence", "pattern"]):
-            results["cross_column_intelligence"] = profile.get("raw_llm_narrative", "")
+        for alert in profile.get("drift_alerts", []):
+            add(f"Drift alert column '{alert['column_name']}': "
+                f"{alert['metric']} changed {alert['prior_value']} → {alert['current_value']} "
+                f"delta={alert['delta']}.", "drift")
 
-    # Unstructured — CDE search
-    if modality == "unstructured":
-        cdes = profile.get("critical_data_elements", [])
-        matching = [
-            f for f in cdes
-            if (query_lower in f.get("field_name", "").lower() or
-                query_lower in str(f.get("value") or "").lower() or
-                any(w in query_lower for w in ["all", "every", "list"]))
-        ]
-        if matching:
-            results["critical_data_elements"] = matching[:15]
+        for para in (profile.get("raw_llm_narrative") or "").split("\n\n")[:10]:
+            if para.strip(): add(f"Cross-column intelligence: {para.strip()}", "intelligence")
 
-        findings = profile.get("additional_findings", [])
-        matching_findings = [
-            f for f in findings
-            if query_lower in f.get("field_name", "").lower() or
-               query_lower in str(f.get("value") or "").lower() or
-               any(w in query_lower for w in ["all", "every", "additional", "more"])
-        ]
-        if matching_findings:
-            results["additional_findings"] = matching_findings[:10]
+    # ── UNSTRUCTURED ─────────────────────────────────────────
+    elif str(modality) in ("unstructured", "DataModality.UNSTRUCTURED"):
+        add(f"Document '{filename}' type={profile.get('document_type')} "
+            f"pages={profile.get('page_count')} scanned={profile.get('is_scanned')} "
+            f"tables={profile.get('has_tables')}. "
+            f"CDEs {profile.get('total_cdes_found')}/{profile.get('total_cdes_expected')}. "
+            f"Core CDEs {profile.get('core_cdes_found')}/{profile.get('core_cdes_expected')}.",
+            "overview")
 
-        if any(w in query_lower for w in ["summary", "overview", "executive", "describe"]):
-            results["executive_summary"] = (profile.get("summary") or {}).get("executive", "")[:500]
+        for cde in profile.get("critical_data_elements", []):
+            fname = cde.get("field_name", "unknown")
+            val   = cde.get("value")
+            if val:
+                text = f"Field '{fname}' value: {val}."
+                if cde.get("business_definition"): text += f" {cde['business_definition']}."
+                if cde.get("raw_text"):            text += f' Source: "{cde["raw_text"][:200]}".'
+                prov = cde.get("provenance") or {}
+                if prov.get("page"):               text += f" Page {prov['page']}."
+                cs = prov.get("confidence_score")
+                if cs is not None:                 text += f" Confidence {int(cs*100)}%."
+                if cde.get("confidence_rationale"): text += f" {cde['confidence_rationale']}"
+                if cde.get("is_cde"):              text += " Critical Data Element."
+                if cde.get("info_classification"): text += f" {cde['info_classification']}."
+                if cde.get("pii_classification"):  text += f" PII: {cde['pii_classification']}."
+            else:
+                text = f"Field '{fname}' NOT FOUND."
+                if cde.get("not_found_reason"):    text += f" {cde['not_found_reason']}"
+            add(text, "cde", field=str(fname))
 
-        if any(w in query_lower for w in ["party", "parties", "borrower", "lender", "guarantor"]):
-            results["parties"] = profile.get("parties", [])
+        for party in profile.get("parties", []):
+            if party.get("value"):
+                add(f"Party '{party['field_name']}': {party['value']}. "
+                    f"{party.get('business_definition','')}", "party")
 
-        if any(w in query_lower for w in ["date", "maturity", "effective", "payment"]):
-            results["key_dates"] = profile.get("key_dates", [])
+        for ob in profile.get("obligations", []):
+            text = f"Obligation {ob['obligation_type']}: {ob['description']}."
+            if ob.get("trigger_language"):  text += f" Trigger: {ob['trigger_language']}."
+            if ob.get("party_responsible"): text += f" Party: {ob['party_responsible']}."
+            add(text, "obligation")
 
-        if any(w in query_lower for w in ["amount", "money", "dollar", "payment", "principal"]):
-            results["monetary_amounts"] = profile.get("monetary_amounts", [])
+        amounts = [f"{a['field_name']}: {a['value']}"
+                   for a in profile.get("monetary_amounts", [])[:25] if a.get("value")]
+        if amounts: add("Monetary amounts: " + " | ".join(amounts), "amounts")
 
-        if any(w in query_lower for w in ["obligation", "covenant", "default", "condition"]):
-            results["obligations"] = profile.get("obligations", [])[:10]
+        dates = [f"{d['field_name']}: {d['value']}"
+                 for d in profile.get("key_dates", [])[:20] if d.get("value")]
+        if dates: add("Key dates: " + " | ".join(dates), "dates")
 
-        if any(w in query_lower for w in ["page", "page count", "pages"]):
-            results["page_count"] = profile.get("page_count")
+        for f in profile.get("additional_findings", [])[:15]:
+            if f.get("value"):
+                add(f"Finding '{f['field_name']}': {f['value']}. "
+                    f"{f.get('business_definition','')}", "finding")
 
-        if any(w in query_lower for w in ["completeness", "complete", "missing field"]):
-            results["completeness_score"] = profile.get("completeness_score")
-            results["found_fields_count"] = profile.get("found_fields_count")
-            results["expected_fields_count"] = profile.get("expected_fields_count")
+        for para in ((profile.get("summary") or {}).get("executive", "") or "").split("\n\n")[:7]:
+            if para.strip(): add(f"Executive summary: {para.strip()}", "summary")
 
-    # Semi-structured
-    if modality == "semi_structured":
-        results["row_count"] = profile.get("row_count")
-        results["column_count"] = profile.get("column_count")
-        results["schema_fields"] = profile.get("critical_data_elements", [])[:10]
+        for para in ((profile.get("summary") or {}).get("detailed", "") or "").split("\n\n")[:10]:
+            if para.strip(): add(f"Detailed summary: {para.strip()}", "detailed_summary")
 
-    return results if results else {"message": "No relevant data found for this query in the profile."}
+        for para in (profile.get("raw_llm_narrative") or "").split("\n\n")[:6]:
+            if para.strip(): add(f"Risk narrative: {para.strip()}", "narrative")
 
+        for sf in profile.get("extraction_schema", [])[:30]:
+            add(f"Schema field '{sf.get('field_name')}': {sf.get('description')} "
+                f"type={sf.get('semantic_type')} is_cde={sf.get('is_cde')} "
+                f"core={sf.get('is_core_field')}", "schema")
 
-def tool_compute(profile: dict, expression: str) -> dict:
-    """
-    Run simple computations on profile data.
-    E.g. average interest rate, total loan amount, days until maturity.
-    """
-    try:
-        expr_lower = expression.lower()
-        result = {}
+    # ── SEMI-STRUCTURED ──────────────────────────────────────
+    elif str(modality) in ("semi_structured", "DataModality.SEMI_STRUCTURED"):
+        add(f"File '{filename}' {profile.get('row_count')} records "
+            f"{profile.get('column_count')} fields "
+            f"{profile.get('duplicate_row_count', 0)} duplicates "
+            f"health {profile.get('health_score')}.", "overview")
 
-        modality = profile.get("modality", "")
+        for col in profile.get("columns", []):
+            p = [f"Field '{col['column_name']}' type {col.get('var_type')}"]
+            if col.get("business_definition"): p.append(col["business_definition"])
+            mp = col.get("missing_pct") or 0
+            if mp > 0: p.append(f"Missing {mp}%")
+            if col.get("mean") is not None:
+                p.append(f"Mean {col['mean']} Min {col['min']} Max {col['max']}")
+            add(" | ".join(p), "field", field=str(col["column_name"]))
 
-        if modality == "structured":
-            cols = profile.get("columns", [])
-            numeric_cols = {c["column_name"]: c for c in cols if c.get("mean") is not None}
+        for sf in profile.get("critical_data_elements", []):
+            add(f"Schema '{sf['field_name']}': {sf.get('value','')}. "
+                f"{sf.get('business_definition','')}", "schema")
 
-            # Average
-            if "average" in expr_lower or "mean" in expr_lower:
-                for col_name, col in numeric_cols.items():
-                    if col_name.lower() in expr_lower:
-                        result = {
-                            "computation": f"Average of {col_name}",
-                            "result": col.get("mean"),
-                            "note": f"Based on {profile.get('row_count')} rows",
-                        }
+        for alert in profile.get("drift_alerts", []):
+            add(f"Drift '{alert['column_name']}' {alert['metric']} "
+                f"{alert['prior_value']}→{alert['current_value']}.", "drift")
 
-            # Sum approximation
-            if "total" in expr_lower or "sum" in expr_lower:
-                for col_name, col in numeric_cols.items():
-                    if col_name.lower() in expr_lower:
-                        approx_sum = (col.get("mean") or 0) * (profile.get("row_count") or 1)
-                        result = {
-                            "computation": f"Approximate total of {col_name}",
-                            "result": round(approx_sum, 2),
-                            "note": "Approximation: mean × row count",
-                        }
+        for para in (profile.get("raw_llm_narrative") or "").split("\n\n")[:8]:
+            if para.strip(): add(f"Intelligence: {para.strip()}", "intelligence")
 
-            # Missing count
-            if "missing" in expr_lower:
-                for col_name, col in {c["column_name"]: c for c in cols}.items():
-                    if col_name.lower() in expr_lower:
-                        result = {
-                            "computation": f"Missing values in {col_name}",
-                            "result": col.get("missing_count"),
-                            "percentage": f"{col.get('missing_pct')}%",
-                        }
-
-        if modality == "unstructured":
-            # Days until maturity
-            if "days" in expr_lower or "maturity" in expr_lower:
-                from datetime import datetime
-                dates = profile.get("key_dates", [])
-                maturity = next((d for d in dates if "maturity" in d.get("field_name", "").lower()), None)
-                if maturity and maturity.get("value"):
-                    try:
-                        mat_date = datetime.strptime(maturity["value"], "%B %d, %Y")
-                        days = (mat_date - datetime.utcnow()).days
-                        result = {
-                            "computation": "Days until maturity",
-                            "result": days,
-                            "maturity_date": maturity["value"],
-                            "note": f"{'Future' if days > 0 else 'Past'} date",
-                        }
-                    except Exception:
-                        result = {"message": "Could not parse maturity date"}
-
-        return result if result else {"message": f"Could not compute: {expression}"}
-
-    except Exception as e:
-        return {"error": str(e)}
+    return chunks
 
 
 # ─────────────────────────────────────────────
-# AGENT NODES
+# INDEXING  — pure numpy, no external deps
 # ─────────────────────────────────────────────
 
-def node_router(state: AgentState) -> AgentState:
-    """
-    Decides which tool to call based on the question.
-    Runs the tool and stores results.
-    """
-    messages = state["messages"]
-    last = messages[-1]
-    question = last.content if hasattr(last, 'content') else last.get("content", "") if isinstance(last, dict) else str(last)
-    profile = state["profile"]
-    question_lower = question.lower()
+def _ensure_indexed(profile: ProfileContract) -> None:
+    pid = profile.profile_id
+    if pid in _store:
+        return
 
-    tool_results = []
+    chunks = _build_chunks(profile.model_dump())
+    if not chunks:
+        print(f"  [LensBot] WARNING: 0 chunks for '{profile.filename}' — skipped")
+        return
 
-    # Always search profile first
-    search_result = tool_search_profile(profile, question)
-    tool_results.append({
-        "tool": "search_profile",
-        "query": question,
-        "result": search_result,
-    })
+    texts = [c["text"] for c in chunks]
+    vec   = _Vectorizer()
+    embs  = vec.fit_transform(texts)   # (N, 384) float32, unit vectors
 
-    # Also compute if mathematical question
-    compute_keywords = ["average", "mean", "total", "sum", "how many", "count",
-                        "days until", "calculate", "compute", "how much"]
-    if any(kw in question_lower for kw in compute_keywords):
-        compute_result = tool_compute(profile, question)
-        tool_results.append({
-            "tool": "compute",
-            "expression": question,
-            "result": compute_result,
-        })
-
-    return {**state, "tool_results": tool_results}
-
-
-def node_synthesise(state: AgentState) -> AgentState:
-    """
-    Takes tool results and generates a cited, accurate answer.
-    Anti-hallucination: if data not in tool results, says so.
-    """
-    messages = state["messages"]
-    last = messages[-1]
-    question = last.content if hasattr(last, 'content') else last.get("content", "") if isinstance(last, dict) else str(last)
-    profile = state["profile"]
-    tool_results = state["tool_results"]
-
-    # Build context from tool results
-    context_parts = []
-    for tr in tool_results:
-        context_parts.append(
-            f"Tool: {tr['tool']}\n"
-            f"Result: {json.dumps(tr['result'], indent=2, default=str)[:2000]}"
-        )
-    context = "\n\n".join(context_parts)
-
-    modality = profile.get("modality", "structured")
-    filename = profile.get("filename", "the document")
-
-    system_prompt = f"""You are LensBot, an intelligent data assistant for Wells Fargo CDO.
-You answer questions about data profiles generated by the Lens platform.
-
-FILE: {filename}
-MODALITY: {modality}
-
-CRITICAL RULES — READ CAREFULLY:
-1. ONLY use the tool results provided below to answer
-2. If the answer is NOT in the tool results, say EXACTLY:
-   "This information is not available in the current profile."
-3. NEVER use your general knowledge or training data to answer
-4. NEVER invent numbers, dates, or facts
-5. Always be specific — cite column names, values, page numbers
-6. Keep answers concise and professional
-7. For banking professionals — use appropriate terminology
-
-TOOL RESULTS (your ONLY source of truth):
-{context}"""
-
-    try:
-        response = groq_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": question},
-            ],
-            temperature=0.1,
-            max_tokens=1024,
-        )
-        answer = response.choices[0].message.content.strip()
-    except Exception as e:
-        answer = f"I encountered an error processing your question: {str(e)}"
-
-    return {**state, "final_answer": answer}
+    _store[pid] = {"embs": embs, "chunks": chunks, "vec": vec}
+    print(f"  [LensBot] Indexed {len(chunks)} chunks for '{profile.filename}' "
+          f"(TF-IDF/RP {EMBED_DIM}-d, pure numpy cosine search)")
 
 
 # ─────────────────────────────────────────────
-# BUILD GRAPH
+# RETRIEVAL  — brute-force cosine similarity
+# Unit vectors → cosine sim = dot product
 # ─────────────────────────────────────────────
 
-def build_agent():
-    graph = StateGraph(AgentState)
-    graph.add_node("router",    node_router)
-    graph.add_node("synthesise", node_synthesise)
-    graph.set_entry_point("router")
-    graph.add_edge("router", "synthesise")
-    graph.add_edge("synthesise", END)
-    return graph.compile()
+def _retrieve(question: str, profile_id: str,
+              k: int = 10) -> list[tuple[str, dict, float]]:
+    entry = _store.get(profile_id)
+    if not entry:
+        return []
 
+    vec    = entry["vec"]
+    embs   = entry["embs"]    # (N, 384)
+    chunks = entry["chunks"]
 
-agent = build_agent()
+    q_emb = vec.transform([question])[0]  # (384,) unit vector
+
+    # cosine similarity = dot product (unit vectors)
+    sims = embs @ q_emb                   # (N,) in [-1, 1]
+
+    # Convert to cosine distance [0, 2] to match previous interface
+    dists = (1.0 - sims).astype(float)
+
+    top_k = min(k, len(chunks))
+    idx   = np.argsort(dists)[:top_k]
+
+    # Keep hits with cosine similarity > 0.1  (distance < 0.9)
+    return [
+        (chunks[i]["text"], chunks[i]["metadata"], float(dists[i]))
+        for i in idx
+        if dists[i] < 0.9
+    ]
 
 
 # ─────────────────────────────────────────────
@@ -332,28 +319,76 @@ def ask_lensbot(
     history: list[dict] | None = None,
 ) -> dict:
     """
-    Main entry point.
-    Returns: { answer, tool_results, citations }
+    Pure-numpy vector RAG for LensBot.
+    Embeddings: TF-IDF + Random Projection (numpy only, no external deps).
+    Retrieval:  brute-force cosine similarity — instant for < 500 chunks.
+    Synthesis:  Groq / Llama-4, grounded in retrieved chunks only.
     """
-    profile_dict = profile.model_dump()
+    _ensure_indexed(profile)
+    hits = _retrieve(question, profile.profile_id, k=10)
 
-    messages = []
+    print(f"  [LensBot] Q='{question[:60]}' → {len(hits)} hits")
+
+    if hits:
+        context = "\n\n".join(
+            f"[{m.get('section','?').upper()} — Source {i+1} "
+            f"({int((1 - dist/2)*100)}% match)]\n{text}"
+            for i, (text, m, dist) in enumerate(hits)
+        )
+    else:
+        context = "No relevant profile data found for this question."
+
+    system_prompt = f"""You are LensBot, a data intelligence assistant for the Wells Fargo CDO Lens platform.
+You answer questions about the specific data profile described below.
+
+FILE: {profile.filename}
+MODALITY: {profile.modality}
+HEALTH SCORE: {profile.health_score}/100
+
+RETRIEVED PROFILE CONTEXT (your ONLY source of truth):
+───────────────────────────────────────────────────────
+{context}
+───────────────────────────────────────────────────────
+
+ABSOLUTE RULES:
+1. Answer ONLY from the retrieved context above. Never use training knowledge.
+2. If the answer is NOT in the context, say exactly:
+   "This information is not available in the current profile."
+3. Never invent, infer, or estimate values.
+4. Cite column names, field values, page numbers exactly as they appear.
+5. Be concise and professional."""
+
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     if history:
-        messages.extend(history[-6:])  # last 3 exchanges for context
+        for msg in history[-6:]:
+            if msg.get("role") in ("user", "assistant"):
+                messages.append({"role": msg["role"], "content": msg.get("content", "")})
     messages.append({"role": "user", "content": question})
 
-    initial_state: AgentState = {
-        "messages":     messages,
-        "profile":      profile_dict,
-        "tool_results": [],
-        "final_answer": "",
-        "citations":    [],
-    }
+    try:
+        resp = groq_client.chat.completions.create(
+            model=LLM_MODEL, messages=messages, temperature=0.05, max_tokens=1024,
+            timeout=30.0,
+        )
+        raw    = resp.choices[0].message.content
+        answer = (raw or "").strip() or "No response generated."
+        print(f"  [LensBot] Answer ({len(answer)} chars): {answer[:80]!r}")
+    except Exception as e:
+        answer = f"Error generating response: {e}"
+        print(f"  [LensBot] LLM error: {e}")
 
-    result = agent.invoke(initial_state)
+    sections = sorted({m.get("section", "?") for _, m, _ in hits})
+    top_sim  = int((1 - hits[0][2] / 2) * 100) if hits else 0
 
     return {
-        "answer":       result["final_answer"],
-        "tool_results": result["tool_results"],
-        "model":        LLM_MODEL,
+        "answer": answer,
+        "tool_results": [{
+            "tool":   "numpy_vector_search",
+            "result": {
+                "chunks_retrieved":  len(hits),
+                "sections":          sections,
+                "top_relevance_pct": top_sim,
+            },
+        }],
+        "model": LLM_MODEL,
     }

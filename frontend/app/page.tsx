@@ -159,11 +159,13 @@ function IconSemi() {
 export default function HomePage() {
   const router = useRouter()
   const [activeTab, setActiveTab] = useState<'profiler' | 'dataforge'>('profiler')
-  const [dragging, setDragging]   = useState(false)
-  const [uploading, setUploading] = useState(false)
-  const [progress, setProgress]   = useState('')
-  const [error, setError]         = useState('')
-  const inputRef = useRef<HTMLInputElement>(null)
+  const [dragging, setDragging]       = useState(false)
+  const [globalDragging, setGlobalDragging] = useState(false)
+  const [uploading, setUploading]     = useState(false)
+  const [progress, setProgress]       = useState('')
+  const [error, setError]             = useState('')
+  const inputRef    = useRef<HTMLInputElement>(null)
+  const dragCounter = useRef(0)
 
   useEffect(() => {
     const read = () => {
@@ -210,6 +212,38 @@ export default function HomePage() {
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault(); setDragging(false)
     const f = e.dataTransfer.files[0]; if (f) handleFile(f)
+  }, [handleFile])
+
+  // ── Window-wide drag: whole page is a drop zone ───────────
+  useEffect(() => {
+    const onEnter = (e: DragEvent) => {
+      e.preventDefault()
+      dragCounter.current += 1
+      if (dragCounter.current === 1) setGlobalDragging(true)
+    }
+    const onLeave = () => {
+      dragCounter.current -= 1
+      if (dragCounter.current <= 0) { dragCounter.current = 0; setGlobalDragging(false) }
+    }
+    const onOver = (e: DragEvent) => e.preventDefault()
+    const onWindowDrop = (e: DragEvent) => {
+      e.preventDefault()
+      dragCounter.current = 0
+      setGlobalDragging(false)
+      setDragging(false)
+      const file = e.dataTransfer?.files[0]
+      if (file) handleFile(file)
+    }
+    window.addEventListener('dragenter', onEnter)
+    window.addEventListener('dragleave', onLeave)
+    window.addEventListener('dragover',  onOver)
+    window.addEventListener('drop',      onWindowDrop)
+    return () => {
+      window.removeEventListener('dragenter', onEnter)
+      window.removeEventListener('dragleave', onLeave)
+      window.removeEventListener('dragover',  onOver)
+      window.removeEventListener('drop',      onWindowDrop)
+    }
   }, [handleFile])
 
   const FILE_CHIPS = [
@@ -332,7 +366,6 @@ export default function HomePage() {
             <div
               onDragOver={e => { e.preventDefault(); setDragging(true) }}
               onDragLeave={() => setDragging(false)}
-              onDrop={onDrop}
               onClick={() => !uploading && inputRef.current?.click()}
               style={{
                 border: `1.5px dashed ${dragging ? '#D71E2B' : 'rgba(0,0,0,0.13)'}`,
@@ -451,6 +484,68 @@ export default function HomePage() {
       <div style={{ display: activeTab === 'dataforge' ? 'block' : 'none' }}>
         <DataForge />
       </div>
+
+      {/* ── Global drop overlay ── */}
+      {globalDragging && activeTab === 'profiler' && !uploading && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 9998,
+          background: 'rgba(10,0,0,0.62)',
+          backdropFilter: 'blur(6px)',
+          WebkitBackdropFilter: 'blur(6px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          pointerEvents: 'none',
+        }}>
+          <div style={{
+            border: '2.5px dashed rgba(255,205,65,0.75)',
+            borderRadius: 24,
+            padding: '52px 80px',
+            textAlign: 'center',
+            background: 'rgba(215,30,43,0.10)',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 0,
+          }}>
+            {/* Pulsing upload icon */}
+            <div style={{
+              width: 76, height: 76, borderRadius: '50%',
+              background: 'var(--wf-red)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              marginBottom: 22,
+              boxShadow: '0 0 0 12px rgba(215,30,43,0.18), 0 0 0 24px rgba(215,30,43,0.08)',
+              animation: 'globalPulse 1.4s ease-in-out infinite',
+            }}>
+              <svg width="34" height="34" viewBox="0 0 28 28" fill="none">
+                <path d="M14 4v16M6 12l8-8 8 8" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M4 22h20" stroke="white" strokeWidth="2.5" strokeLinecap="round"/>
+              </svg>
+            </div>
+            <div style={{
+              fontFamily: 'var(--font-display)', fontSize: 28, fontWeight: 800,
+              color: 'white', marginBottom: 8, letterSpacing: '-0.02em',
+            }}>
+              Drop anywhere to profile
+            </div>
+            <div style={{ fontSize: 14, color: 'rgba(255,255,255,0.6)', marginBottom: 24 }}>
+              Release to start intelligent profiling
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+              {['CSV','XLSX','PDF','DOCX','JSON','XML'].map(ext => (
+                <span key={ext} style={{
+                  fontSize: 11, fontWeight: 600, padding: '4px 12px', borderRadius: 20,
+                  background: 'rgba(255,255,255,0.12)',
+                  color: 'rgba(255,255,255,0.85)',
+                  border: '1px solid rgba(255,255,255,0.22)',
+                  letterSpacing: '0.04em',
+                }}>{ext}</span>
+              ))}
+            </div>
+          </div>
+          <style>{`
+            @keyframes globalPulse {
+              0%,100% { box-shadow: 0 0 0 10px rgba(215,30,43,0.18), 0 0 0 22px rgba(215,30,43,0.07); }
+              50%      { box-shadow: 0 0 0 18px rgba(215,30,43,0.22), 0 0 0 36px rgba(215,30,43,0.10); }
+            }
+          `}</style>
+        </div>
+      )}
 
       <LensBot profile={null} />
     </div>

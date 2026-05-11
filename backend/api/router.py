@@ -350,16 +350,19 @@ class ChatRequest(PydanticBase):
 @router.post("/chat")
 def chat(request: ChatRequest):
     """
-    LensBot — LangGraph agent for answering questions about profiles.
+    LensBot — vector RAG agent for answering questions about profiles.
     Anti-hallucination: only answers from profile data, never invents.
     """
+    print(f"\n[CHAT] question={request.question[:60]!r} profile_id={request.profile_id[:8]}")
     if request.profile_id not in profile_store:
+        print(f"[CHAT] ERROR: profile_id not found in store (store has {len(profile_store)} entries)")
         raise HTTPException(
             status_code=404,
             detail=f"Profile '{request.profile_id}' not found. Please re-upload the file."
         )
 
     profile = profile_store[request.profile_id]
+    print(f"[CHAT] profile found: '{profile.filename}' modality={profile.modality}")
 
     try:
         result = ask_lensbot(
@@ -367,8 +370,10 @@ def chat(request: ChatRequest):
             profile=profile,
             history=request.history,
         )
+        print(f"[CHAT] answer length={len(result.get('answer',''))}")
         return result
     except Exception as e:
+        print(f"[CHAT] EXCEPTION: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── FR Y-14Q Schedule H Validation ───────────────────────

@@ -6,7 +6,7 @@ interface Message {
   role: 'user' | 'bot'
   text: string
   loading?: boolean
-  tool_results?: any[]
+  rag?: { chunks: number; sections: string[]; relevance: number }
 }
 
 interface Props {
@@ -15,17 +15,71 @@ interface Props {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
 
+// ── Smart suggestions per modality ───────────────────────
+function getSuggestions(profile: ProfileContract | null | undefined): string[] {
+  if (!profile) return []
+  if (profile.modality === 'structured') return [
+    'Which columns have missing data?',
+    'Which columns contain PII?',
+    'What is the health score breakdown?',
+    'Are there any drift alerts?',
+    'What are the top values in each column?',
+    'Suggest a primary key',
+  ]
+  if (profile.modality === 'unstructured') return [
+    'Who are the parties in this document?',
+    'What are the key dates?',
+    'What are the main obligations?',
+    'Summarise the document in 3 sentences',
+    'What CDEs were not found?',
+    'What is the confidence for each extracted field?',
+  ]
+  return [
+    'What fields were detected?',
+    'Which fields have low coverage?',
+    'What does the cross-column intelligence say?',
+    'Are there any duplicate records?',
+  ]
+}
+
+// ── Section badge colour ──────────────────────────────────
+function sectionColor(s: string): string {
+  const map: Record<string, string> = {
+    cde: '#D71E2B', obligation: '#B45309', party: '#1D4ED8',
+    summary: '#1A7F4B', column: '#6366F1', overview: '#4A4A4A',
+    health: '#1A7F4B', intelligence: '#7C3AED', drift: '#CC2222',
+    amounts: '#B45309', dates: '#1D4ED8', finding: '#B45309',
+    schema: '#4A4A4A', narrative: '#7C3AED', field: '#6366F1',
+    detailed_summary: '#1A7F4B',
+  }
+  return map[s] || '#4A4A4A'
+}
+
+// ── Simple markdown bold renderer ────────────────────────
+function BotText({ text }: { text: string }) {
+  if (!text) return null
+  return (
+    <span style={{ whiteSpace: 'pre-wrap' }}>
+      {text.split(/(\*\*[^*]+\*\*)/g).map((part, i) =>
+        part.startsWith('**') && part.endsWith('**') ? (
+          <strong key={i} style={{ fontWeight: 600 }}>{part.slice(2, -2)}</strong>
+        ) : <span key={i}>{part}</span>
+      )}
+    </span>
+  )
+}
+
 export default function LensBot({ profile }: Props) {
-  const [open, setOpen] = useState(false)
-  const [messages, setMessages] = useState<Message[]>([{
+  const [open, setOpen]           = useState(false)
+  const [input, setInput]         = useState('')
+  const [loading, setLoading]     = useState(false)
+  const [showSrc, setShowSrc]     = useState<number | null>(null)
+  const [messages, setMessages]   = useState<Message[]>([{
     role: 'bot',
     text: profile
-      ? `Hi! I'm LensBot 🤖\n\nI can answer questions about **${profile.filename}**.\n\nI only answer from the actual profile data — I never guess or hallucinate. If something isn't in the profile, I'll tell you.\n\nWhat would you like to know?`
-      : `Hi! I'm LensBot 🤖\n\nUpload a file and I'll help you understand your data.`,
+      ? `Hi! I'm LensBot.\n\nI can answer questions about **${profile.filename}**.\n\nI use semantic search over the full profile — every column, CDE, obligation, party, and summary is indexed. I never guess: if something isn't in the profile, I'll say so.\n\nWhat would you like to know?`
+      : `Hi! I'm LensBot.\n\nUpload a file and I'll help you explore your data.`,
   }])
-  const [input, setInput] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [showTools, setShowTools] = useState<number | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -36,264 +90,217 @@ export default function LensBot({ profile }: Props) {
     if (profile) {
       setMessages([{
         role: 'bot',
-        text: `Hi! I'm LensBot 🤖\n\nI can answer questions about **${profile.filename}**.\n\nI only answer from the actual profile data — I never guess or hallucinate.\n\nWhat would you like to know?`,
+        text: `Hi! I'm LensBot.\n\nI can answer questions about **${profile.filename}**.\n\nI use semantic search over the full profile — every field, CDE, party, obligation, and summary is indexed. I never guess.\n\nWhat would you like to know?`,
       }])
+      setShowSrc(null)
     }
   }, [profile?.profile_id])
 
-  const getHistory = () => messages
-    .filter(m => !m.loading && m.text)
-    .slice(-6)
-    .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text }))
+  const history = () =>
+    messages
+      .filter(m => !m.loading && m.text)
+      .slice(-6)
+      .map(m => ({ role: m.role === 'user' ? 'user' : 'assistant', content: m.text }))
 
-  const sendMessage = async () => {
+  const send = async () => {
     if (!input.trim() || loading || !profile) return
-    const question = input.trim()
+    const q = input.trim()
     setInput('')
-
-    const newMessages = [...messages, { role: 'user' as const, text: question }]
-    setMessages([...newMessages, { role: 'bot' as const, text: '', loading: true }])
+    const prev = [...messages, { role: 'user' as const, text: q }]
+    setMessages([...prev, { role: 'bot' as const, text: '', loading: true }])
     setLoading(true)
 
     try {
-      const res = await fetch(`${API_BASE}/api/chat`, {
+      const res  = await fetch(`${API_BASE}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          question,
-          profile_id: profile.profile_id,
-          history: getHistory(),
-        }),
+        body: JSON.stringify({ question: q, profile_id: profile.profile_id, history: history() }),
       })
-
       const data = await res.json()
-
       if (!res.ok) throw new Error(data.detail || 'Request failed')
 
-      setMessages([
-        ...newMessages,
-        {
-          role: 'bot',
-          text: data.answer,
-          tool_results: data.tool_results,
-        },
-      ])
+      const ragInfo = data.tool_results?.[0]?.result
+      setMessages([...prev, {
+        role: 'bot',
+        text: data.answer || 'This information is not available in the current profile.',
+        rag: ragInfo ? {
+          chunks:    ragInfo.chunks_retrieved ?? 0,
+          sections:  ragInfo.sections ?? [],
+          relevance: ragInfo.top_relevance_pct ?? 0,
+        } : undefined,
+      }])
     } catch (e: any) {
-      setMessages([
-        ...newMessages,
-        { role: 'bot', text: `Sorry, I encountered an error: ${e.message}` },
-      ])
+      setMessages([...prev, { role: 'bot', text: `Sorry, I ran into an error: ${e.message}` }])
     } finally {
       setLoading(false)
     }
   }
 
-  const suggestions = profile?.modality === 'structured'
-    ? ['What is the health score?', 'Which columns have PII?', 'Any missing data?', 'Suggest a primary key']
-    : profile?.modality === 'unstructured'
-    ? ['Who are the parties?', 'What is the loan amount?', 'When does it mature?', 'Any covenants?']
-    : ['What fields were detected?', 'What is the schema?']
+  const suggestions = getSuggestions(profile)
 
   return (
     <>
-      {/* Floating button */}
-      <button
-        onClick={() => setOpen(!open)}
-        style={{
-          position: 'fixed',
-          bottom: 28,
-          right: 28,
-          width: 60,
-          height: 60,
-          borderRadius: '50%',
-          background: open ? 'var(--wf-red-dark)' : 'var(--wf-red)',
-          border: '3px solid var(--wf-gold)',
-          boxShadow: '0 4px 20px rgba(215,30,43,0.4)',
-          cursor: 'pointer',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          zIndex: 1000,
-          transition: 'all 0.2s ease',
-          transform: open ? 'rotate(45deg)' : 'rotate(0deg)',
-        }}
-        title="Ask LensBot"
-      >
-        {open ? (
-          <svg width="22" height="22" viewBox="0 0 22 22" fill="none">
-            <path d="M4 4l14 14M18 4L4 18" stroke="white" strokeWidth="2.5" strokeLinecap="round"/>
-          </svg>
-        ) : (
-          <span style={{ fontSize: 26, lineHeight: 1 }}>🤖</span>
-        )}
+      <style>{`
+        @keyframes slideUp { from{opacity:0;transform:translateY(14px)} to{opacity:1;transform:translateY(0)} }
+        @keyframes blink   { 0%,100%{opacity:0.25} 50%{opacity:1} }
+        .dot1{animation:blink 1.2s ease-in-out infinite}
+        .dot2{animation:blink 1.2s ease-in-out 0.2s infinite}
+        .dot3{animation:blink 1.2s ease-in-out 0.4s infinite}
+        .lb-sugg:hover{background:var(--surface-3)!important;border-color:var(--wf-red)!important;color:var(--wf-red)!important}
+      `}</style>
+
+      {/* ── Floating button ── */}
+      <button onClick={() => setOpen(!open)} title="Ask LensBot" style={{
+        position: 'fixed', bottom: 28, right: 28,
+        width: 58, height: 58, borderRadius: '50%',
+        background: open ? '#AA1520' : 'var(--wf-red)',
+        border: '2.5px solid var(--wf-gold)',
+        boxShadow: '0 4px 20px rgba(215,30,43,0.38)',
+        cursor: 'pointer', zIndex: 1000,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        transition: 'all 0.2s ease',
+        transform: open ? 'rotate(45deg)' : 'none',
+      }}>
+        {open
+          ? <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 3l14 14M17 3L3 17" stroke="white" strokeWidth="2.4" strokeLinecap="round"/></svg>
+          : <span style={{ fontSize: 24, lineHeight: 1 }}>🤖</span>
+        }
       </button>
 
-      {/* Label */}
+      {/* ── Label ── */}
       {!open && (
         <div style={{
-          position: 'fixed',
-          bottom: 96,
-          right: 28,
-          background: 'var(--ink)',
-          color: 'white',
-          fontSize: 11,
-          fontWeight: 500,
-          padding: '4px 10px',
-          borderRadius: 20,
-          zIndex: 1000,
-          pointerEvents: 'none',
-          letterSpacing: '0.02em',
+          position: 'fixed', bottom: 94, right: 28, zIndex: 1000, pointerEvents: 'none',
+          background: 'var(--ink)', color: 'white',
+          fontSize: 10.5, fontWeight: 500, padding: '3px 10px', borderRadius: 20,
         }}>
           LensBot
         </div>
       )}
 
-      {/* Chat panel */}
+      {/* ── Chat panel ── */}
       {open && (
         <div style={{
-          position: 'fixed',
-          bottom: 100,
-          right: 28,
-          width: 400,
-          height: 560,
+          position: 'fixed', bottom: 98, right: 28,
+          width: 410, height: 570,
           background: 'var(--surface)',
           border: '0.5px solid var(--border-1)',
           borderRadius: 'var(--radius-xl)',
-          boxShadow: '0 16px 48px rgba(0,0,0,0.16)',
-          display: 'flex',
-          flexDirection: 'column',
-          overflow: 'hidden',
-          zIndex: 999,
-          animation: 'slideUp 0.25s ease',
+          boxShadow: '0 16px 48px rgba(0,0,0,0.18)',
+          display: 'flex', flexDirection: 'column', overflow: 'hidden',
+          zIndex: 999, animation: 'slideUp 0.22s ease',
         }}>
-          <style>{`
-            @keyframes slideUp {
-              from { opacity: 0; transform: translateY(16px); }
-              to   { opacity: 1; transform: translateY(0); }
-            }
-            .msg-dot { animation: blink 1.2s ease-in-out infinite; }
-            .msg-dot:nth-child(2) { animation-delay: 0.2s; }
-            .msg-dot:nth-child(3) { animation-delay: 0.4s; }
-            @keyframes blink { 0%,100%{opacity:0.3;} 50%{opacity:1;} }
-          `}</style>
 
           {/* Header */}
           <div style={{
             background: 'var(--wf-red)',
             borderBottom: '2px solid var(--wf-gold)',
-            padding: '14px 18px',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
+            padding: '12px 16px',
+            display: 'flex', alignItems: 'center', gap: 10,
           }}>
             <div style={{
-              width: 34, height: 34,
-              borderRadius: '50%',
-              background: 'rgba(255,255,255,0.15)',
-              border: '1.5px solid rgba(255,205,65,0.6)',
+              width: 32, height: 32, borderRadius: '50%', fontSize: 17,
+              background: 'rgba(255,255,255,0.14)',
+              border: '1.5px solid rgba(255,205,65,0.55)',
               display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 18,
             }}>🤖</div>
-            <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 14, fontWeight: 600, color: 'white', fontFamily: 'var(--font-display)' }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13.5, fontWeight: 600, color: 'white', fontFamily: 'var(--font-display)' }}>
                 LensBot
               </div>
-              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.7)', letterSpacing: '0.04em' }}>
-                {profile ? `Analysing: ${profile.filename.substring(0, 28)}${profile.filename.length > 28 ? '…' : ''}` : 'Wells Fargo CDO Intelligence'}
+              <div style={{ fontSize: 10, color: 'rgba(255,255,255,0.65)', letterSpacing: '0.03em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {profile
+                  ? `${profile.filename.substring(0, 30)}${profile.filename.length > 30 ? '…' : ''}`
+                  : 'Wells Fargo CDO Intelligence'}
               </div>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+            {/* RAG status indicator */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexShrink: 0 }}>
               <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#4ade80', boxShadow: '0 0 0 2px rgba(74,222,128,0.3)' }}/>
-              <span style={{ fontSize: 10, color: 'rgba(255,255,255,0.6)' }}>LangGraph</span>
+              <span style={{ fontSize: 9.5, color: 'rgba(255,255,255,0.6)', letterSpacing: '0.04em' }}>
+                Semantic RAG
+              </span>
             </div>
           </div>
 
           {/* Messages */}
           <div style={{
-            flex: 1,
-            overflowY: 'auto',
-            padding: '16px',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 12,
+            flex: 1, overflowY: 'auto', padding: '14px 14px 8px',
+            display: 'flex', flexDirection: 'column', gap: 10,
             background: 'var(--surface-2)',
           }}>
             {messages.map((msg, i) => (
-              <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 4 }}>
+              <div key={i} style={{
+                display: 'flex', flexDirection: 'column',
+                alignItems: msg.role === 'user' ? 'flex-end' : 'flex-start',
+                gap: 4,
+              }}>
                 <div style={{
-                  maxWidth: '85%',
-                  padding: '10px 14px',
+                  maxWidth: '87%', padding: '10px 13px', fontSize: 13, lineHeight: 1.6,
                   borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
                   background: msg.role === 'user' ? 'var(--wf-red)' : 'var(--surface)',
                   color: msg.role === 'user' ? 'white' : 'var(--ink)',
-                  fontSize: 13,
-                  lineHeight: 1.6,
                   border: msg.role === 'bot' ? '0.5px solid var(--border-1)' : 'none',
                   boxShadow: 'var(--shadow-sm)',
                 }}>
                   {msg.loading ? (
-                    <div style={{ display: 'flex', gap: 4, padding: '2px 0' }}>
-                      {[0,1,2].map(j => (
-                        <div key={j} className="msg-dot" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ink-3)' }}/>
-                      ))}
+                    <div style={{ display: 'flex', gap: 4, padding: '3px 0' }}>
+                      <div className="dot1" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ink-3)' }}/>
+                      <div className="dot2" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ink-3)' }}/>
+                      <div className="dot3" style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--ink-3)' }}/>
                     </div>
                   ) : (
-                    <span style={{ whiteSpace: 'pre-wrap' }}>
-                      {msg.text.split(/(\*\*[^*]+\*\*)/g).map((part, j) =>
-                        part.startsWith('**') && part.endsWith('**') ? (
-                          <strong key={j} style={{ fontWeight: 600, color: 'inherit' }}>
-                            {part.slice(2, -2)}
-                          </strong>
-                        ) : (
-                          <span key={j}>{part}</span>
-                        )
-                      )}
-                    </span>
+                    <BotText text={msg.text || '(no response received)'} />
                   )}
                 </div>
 
-                {/* Tool results toggle */}
-                {msg.tool_results && msg.tool_results.length > 0 && (
-                  <button
-                    onClick={() => setShowTools(showTools === i ? null : i)}
-                    style={{
-                      fontSize: 10,
-                      color: 'var(--ink-3)',
-                      background: 'none',
-                      border: '0.5px solid var(--border-1)',
-                      borderRadius: 8,
-                      padding: '2px 8px',
-                      cursor: 'pointer',
-                      fontFamily: 'var(--font-body)',
-                    }}
-                  >
-                    {showTools === i ? '▲ hide sources' : `▼ view sources (${msg.tool_results.length} tool${msg.tool_results.length > 1 ? 's' : ''})`}
-                  </button>
+                {/* RAG source pill */}
+                {msg.role === 'bot' && msg.rag && msg.rag.chunks > 0 && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                    <button
+                      onClick={() => setShowSrc(showSrc === i ? null : i)}
+                      style={{
+                        fontSize: 10, padding: '2px 9px', borderRadius: 10,
+                        border: '0.5px solid var(--border-2)',
+                        background: showSrc === i ? 'var(--surface-3)' : 'var(--surface)',
+                        color: 'var(--ink-3)', cursor: 'pointer',
+                        fontFamily: 'var(--font-body)',
+                        display: 'flex', alignItems: 'center', gap: 4,
+                      }}
+                    >
+                      <span style={{ color: '#1A7F4B', fontWeight: 600 }}>↗</span>
+                      {msg.rag.chunks} sources · {msg.rag.relevance}% match
+                      {showSrc === i ? ' ▲' : ' ▼'}
+                    </button>
+                  </div>
                 )}
 
-                {/* Tool results expanded */}
-                {showTools === i && msg.tool_results && (
+                {/* Expanded source info */}
+                {showSrc === i && msg.rag && (
                   <div style={{
-                    maxWidth: '85%',
-                    background: 'var(--surface-3)',
-                    border: '0.5px solid var(--border-1)',
-                    borderRadius: 8,
-                    padding: '8px 12px',
-                    fontSize: 11,
-                    color: 'var(--ink-3)',
-                    fontFamily: 'monospace',
-                    maxHeight: 160,
-                    overflowY: 'auto',
-                    lineHeight: 1.5,
+                    maxWidth: '87%', background: 'var(--surface)',
+                    border: '0.5px solid var(--border-1)', borderRadius: 8,
+                    padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 5,
                   }}>
-                    {msg.tool_results.map((tr, j) => (
-                      <div key={j}>
-                        <span style={{ color: 'var(--wf-red)', fontWeight: 600 }}>
-                          [{tr.tool}]
-                        </span>{' '}
-                        {JSON.stringify(tr.result, null, 0).substring(0, 200)}...
-                      </div>
-                    ))}
+                    <div style={{ fontSize: 10, color: 'var(--ink-3)', fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', marginBottom: 2 }}>
+                      Sections searched
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {msg.rag.sections.map(s => (
+                        <span key={s} style={{
+                          fontSize: 10, fontWeight: 600,
+                          padding: '2px 7px', borderRadius: 6,
+                          background: `${sectionColor(s)}15`,
+                          color: sectionColor(s),
+                          border: `0.5px solid ${sectionColor(s)}40`,
+                        }}>
+                          {s}
+                        </span>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--ink-3)', marginTop: 2 }}>
+                      {msg.rag.chunks} chunks retrieved · top match {msg.rag.relevance}% similarity
+                    </div>
                   </div>
                 )}
               </div>
@@ -301,31 +308,21 @@ export default function LensBot({ profile }: Props) {
             <div ref={bottomRef}/>
           </div>
 
-          {/* Suggested questions */}
-          {messages.length === 1 && profile && (
+          {/* Suggestions (only before first user message) */}
+          {messages.filter(m => m.role === 'user').length === 0 && profile && (
             <div style={{
-              padding: '8px 12px',
-              background: 'var(--surface)',
+              padding: '8px 10px', background: 'var(--surface)',
               borderTop: '0.5px solid var(--border-1)',
-              display: 'flex',
-              gap: 6,
-              flexWrap: 'wrap',
+              display: 'flex', gap: 5, flexWrap: 'wrap',
             }}>
-              {suggestions.map(q => (
-                <button
-                  key={q}
-                  onClick={() => setInput(q)}
-                  style={{
-                    fontSize: 11,
-                    padding: '4px 10px',
-                    borderRadius: 12,
-                    border: '0.5px solid var(--border-2)',
-                    background: 'var(--surface-2)',
-                    color: 'var(--ink-2)',
-                    cursor: 'pointer',
-                    fontFamily: 'var(--font-body)',
-                  }}
-                >
+              {suggestions.slice(0, 4).map(q => (
+                <button key={q} className="lb-sugg" onClick={() => setInput(q)} style={{
+                  fontSize: 10.5, padding: '4px 10px', borderRadius: 12,
+                  border: '0.5px solid var(--border-2)',
+                  background: 'var(--surface-2)', color: 'var(--ink-2)',
+                  cursor: 'pointer', fontFamily: 'var(--font-body)',
+                  transition: 'all 0.15s ease',
+                }}>
                   {q}
                 </button>
               ))}
@@ -334,48 +331,35 @@ export default function LensBot({ profile }: Props) {
 
           {/* Input */}
           <div style={{
-            padding: '12px',
-            borderTop: '0.5px solid var(--border-1)',
-            display: 'flex',
-            gap: 8,
-            background: 'var(--surface)',
+            padding: '10px 12px', borderTop: '0.5px solid var(--border-1)',
+            display: 'flex', gap: 8, background: 'var(--surface)',
           }}>
             <input
               value={input}
               onChange={e => setInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && sendMessage()}
+              onKeyDown={e => e.key === 'Enter' && !e.shiftKey && send()}
               placeholder={profile ? 'Ask about your data...' : 'Upload a file first...'}
               disabled={!profile || loading}
               style={{
-                flex: 1,
-                padding: '9px 14px',
-                borderRadius: 20,
-                border: '0.5px solid var(--border-2)',
-                fontSize: 13,
+                flex: 1, padding: '8px 13px', borderRadius: 20,
+                border: '0.5px solid var(--border-2)', fontSize: 13,
                 background: profile ? 'var(--surface-2)' : 'var(--surface-3)',
-                color: 'var(--ink)',
-                outline: 'none',
+                color: 'var(--ink)', outline: 'none',
                 fontFamily: 'var(--font-body)',
               }}
             />
             <button
-              onClick={sendMessage}
+              onClick={send}
               disabled={!input.trim() || loading || !profile}
               style={{
-                width: 38,
-                height: 38,
-                borderRadius: '50%',
+                width: 36, height: 36, borderRadius: '50%', flexShrink: 0,
                 background: input.trim() && profile ? 'var(--wf-red)' : 'var(--surface-3)',
-                border: 'none',
-                cursor: input.trim() && profile ? 'pointer' : 'default',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                flexShrink: 0,
+                border: 'none', cursor: input.trim() && profile ? 'pointer' : 'default',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
                 transition: 'background 0.15s ease',
               }}
             >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
                 <path d="M14 8L2 2l3 6-3 6 12-6z" fill="white"/>
               </svg>
             </button>
