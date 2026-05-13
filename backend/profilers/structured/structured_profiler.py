@@ -154,11 +154,11 @@ def compute_health_score(df: pd.DataFrame, columns: list[ColumnProfile]) -> tupl
 # ─────────────────────────────────────────────
 # COLUMN PROFILER
 # ─────────────────────────────────────────────
-def generate_column_definitions(columns: list) -> dict[str, str]:
+def generate_column_definitions(columns: list) -> dict[str, dict]:
     """
-    One LLM call generates plain English business definitions
-    for all columns. Works for any CSV — no hardcoding.
-    Returns dict of column_name -> definition.
+    One LLM call generates business definitions + CDE/classification flags
+    for all columns. Returns dict of column_name -> {definition, is_cde,
+    info_classification, pii_classification}.
     """
     try:
         client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -181,26 +181,39 @@ def generate_column_definitions(columns: list) -> dict[str, str]:
                 "is_pii":        col.is_pii,
             })
 
-        prompt = f"""You are a data steward writing a business data dictionary.
+        prompt = f"""You are a senior data steward at a financial institution writing a business data dictionary.
 
-For each column below write a short generic business definition (1 sentence, plain English).
-Explain what this field represents in a business context.
-Do NOT repeat the column name in the definition.
+For each column below, provide:
+- definition: one sentence plain-English business meaning (do NOT repeat the column name)
+- is_cde: true if this field is material to regulatory reporting, risk management, or key business decisions; false otherwise
+- info_classification: one of Public / Internal / Confidential / Restricted
+- pii_classification: one of PII / Sensitive / Non-PII
+  (PII = directly identifies a person; Sensitive = indirectly sensitive e.g. account balances; Non-PII = not personal)
 
 Columns:
 {_json.dumps(col_context, indent=2)}
 
-Respond ONLY with a JSON object. No markdown, no backticks:
+Respond ONLY with a JSON object mapping each column name to its attributes. No markdown, no backticks:
 {{
-  "loan_id": "A unique identifier assigned to each loan record.",
-  "borrower_name": "The full legal name of the individual or entity receiving the loan."
+  "loan_id": {{
+    "definition": "A unique identifier assigned to each loan record.",
+    "is_cde": true,
+    "info_classification": "Internal",
+    "pii_classification": "Non-PII"
+  }},
+  "borrower_ssn": {{
+    "definition": "The Social Security Number of the primary borrower.",
+    "is_cde": true,
+    "info_classification": "Restricted",
+    "pii_classification": "PII"
+  }}
 }}"""
 
         response = client.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
-            max_tokens=2048,
+            max_tokens=4096,
         )
 
         text = response.choices[0].message.content.strip()
@@ -786,11 +799,19 @@ def profile_structured(
     # ── Profile each column ──────────────────
     columns = [profile_column(df[col]) for col in df.columns]
 
-    # ── Generate business definitions (one LLM call for all columns) ──
-    print("  [Lens] Generating column definitions via LLM...")
+    # ── Generate business definitions + CDE/classification (one LLM call) ──
+    print("  [Lens] Generating column definitions + CDE classifications via LLM...")
     definitions = generate_column_definitions(columns)
     for col in columns:
-        col.business_definition = definitions.get(col.column_name)
+        entry = definitions.get(col.column_name)
+        if isinstance(entry, dict):
+            col.business_definition  = entry.get("definition")
+            col.is_cde               = bool(entry.get("is_cde", False))
+            col.info_classification  = entry.get("info_classification", "Internal")
+            col.pii_classification   = entry.get("pii_classification", "Non-PII")
+        elif isinstance(entry, str):
+            # backward-compat: old plain-string response
+            col.business_definition = entry
 
     # ── Health score ─────────────────────────
     health, breakdown = compute_health_score(df, columns)

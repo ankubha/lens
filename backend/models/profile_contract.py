@@ -115,6 +115,9 @@ class ColumnProfile(BaseModel):
     is_pii: bool = False
     sensitivity: SensitivityTier = SensitivityTier.INTERNAL
     business_definition: str | None = None
+    is_cde: bool = False
+    info_classification: Literal["Public", "Internal", "Confidential", "Restricted"] = "Internal"
+    pii_classification: Literal["PII", "Sensitive", "Non-PII"] = "Non-PII"
     histogram: list[dict] | None = None      # [{bin_start, bin_end, count}]
     extreme_min: list[dict] | None = None    # [{value, count}] bottom 10
     extreme_max: list[dict] | None = None    # [{value, count}] top 10

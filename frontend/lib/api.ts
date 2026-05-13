@@ -76,6 +76,9 @@ export interface ColumnProfile {
   is_pii: boolean
   sensitivity: string
   business_definition?: string
+  is_cde?: boolean
+  info_classification?: 'Public' | 'Internal' | 'Confidential' | 'Restricted'
+  pii_classification?: 'PII' | 'Sensitive' | 'Non-PII'
   // All-type stats
   infinite_count?: number
   infinite_pct?: number

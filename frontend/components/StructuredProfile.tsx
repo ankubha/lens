@@ -661,7 +661,7 @@ function VariablesTab({ profile, selectedCol, setSelectedCol }: {
               >
                 <div style={{ fontSize: 13, fontWeight: isSelected ? 500 : 400, color: 'var(--ink)', display: 'flex', alignItems: 'center', gap: 6 }}>
                   {col.column_name}
-                  {col.is_pii && <span style={{ fontSize: 9, background: 'var(--wf-red)', color: 'white', padding: '1px 4px', borderRadius: 3 }}>PII</span>}
+                  {(col.pii_classification === 'PII' || (!col.pii_classification && col.is_pii)) && <span style={{ fontSize: 9, background: 'var(--wf-red)', color: 'white', padding: '1px 4px', borderRadius: 3 }}>PII</span>}
                 </div>
                 <span style={{ display: 'inline-block', marginTop: 3, fontSize: 10, fontWeight: 500, padding: '1px 6px', borderRadius: 3, background: bg, color: text }}>
                   {col.var_type ?? col.data_type}
@@ -682,7 +682,7 @@ function VariablesTab({ profile, selectedCol, setSelectedCol }: {
               <span style={{ fontFamily: 'var(--font-display)', fontSize: 20, fontWeight: 700, color: 'var(--ink)' }}>{selectedCol.column_name}</span>
               {(() => { const { bg, text } = varTypeColor(selectedCol.var_type); return <span style={{ fontSize: 12, fontWeight: 600, padding: '2px 10px', borderRadius: 20, background: bg, color: text }}>{selectedCol.var_type ?? selectedCol.data_type}</span> })()}
               {selectedCol.semantic_type && <Badge variant="info" label={selectedCol.semantic_type.replace(/_/g, ' ')} />}
-              {selectedCol.is_pii && <Badge variant="pii" label="PII" />}
+              {(selectedCol.pii_classification === 'PII' || (!selectedCol.pii_classification && selectedCol.is_pii)) && <Badge variant="pii" label="PII" />}
               <Badge variant={selectedCol.sensitivity as any} label={selectedCol.sensitivity} />
             </div>
           </Card>
@@ -1615,7 +1615,7 @@ export default function StructuredProfile({ profile, activeTab }: Props) {
                         <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--ink)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{col.column_name}</div>
                         {(() => { const { bg, text } = varTypeColor(col.var_type); return <span style={{ fontSize: 9, fontWeight: 600, padding: '0 5px', borderRadius: 3, background: bg, color: text }}>{col.var_type ?? col.data_type}</span> })()}
                       </div>
-                      {col.is_pii && <span style={{ fontSize: 9, background: 'var(--wf-red)', color: 'white', padding: '1px 4px', borderRadius: 3, flexShrink: 0 }}>PII</span>}
+                      {(col.pii_classification === 'PII' || (!col.pii_classification && col.is_pii)) && <span style={{ fontSize: 9, background: 'var(--wf-red)', color: 'white', padding: '1px 4px', borderRadius: 3, flexShrink: 0 }}>PII</span>}
                     </div>
 
                     {/* Score cells */}
@@ -1683,7 +1683,7 @@ export default function StructuredProfile({ profile, activeTab }: Props) {
           <table style={{ width: '100%', borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ background: 'var(--surface-2)' }}>
-                {['Field Name', 'Data Type', 'Semantic Type', 'Business Definition', 'PII', 'Sensitivity', 'Missing %', 'Sample Values'].map(h => (
+                {['Field Name', 'Data Type', 'Semantic Type', 'Business Definition', 'CDE', 'Info Class', 'PII Class', 'Sensitivity', 'Missing %', 'Sample Values'].map(h => (
                   <th key={h} style={{ padding: '10px 14px', textAlign: 'left', fontSize: 11, fontWeight: 500, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.05em', borderBottom: '0.5px solid var(--border-1)', whiteSpace: 'nowrap' }}>{h}</th>
                 ))}
               </tr>
@@ -1691,21 +1691,48 @@ export default function StructuredProfile({ profile, activeTab }: Props) {
             <tbody>
               {profile.columns.map((col, i) => (
                 <tr key={col.column_name} style={{ background: i % 2 === 0 ? 'var(--surface)' : 'var(--surface-2)', borderBottom: '0.5px solid var(--border-1)' }}>
-                  <td style={{ padding: '10px 14px', fontWeight: 500, fontSize: 13 }}>{col.column_name}</td>
+                  <td style={{ padding: '10px 14px', fontWeight: 600, fontSize: 13, whiteSpace: 'nowrap' }}>{col.column_name}</td>
                   <td style={{ padding: '10px 14px' }}>
                     <code style={{ fontSize: 11, background: 'var(--surface-3)', padding: '2px 6px', borderRadius: 4, color: 'var(--ink-2)' }}>{col.data_type}</code>
                   </td>
                   <td style={{ padding: '10px 14px', fontSize: 12, color: 'var(--info)' }}>{col.semantic_type?.replace(/_/g, ' ') || '—'}</td>
-                  <td style={{ padding: '10px 14px', fontSize: 12, color: 'var(--ink-2)', lineHeight: 1.6, maxWidth: 280 }}>
-                    {(col as any).business_definition || '—'}
+                  <td style={{ padding: '10px 14px', fontSize: 12, color: 'var(--ink-2)', lineHeight: 1.6, maxWidth: 260 }}>
+                    {col.business_definition || '—'}
                   </td>
-                  <td style={{ padding: '10px 14px' }}>{col.is_pii ? <Badge variant="pii" label="Yes" /> : <span style={{ color: 'var(--ink-3)', fontSize: 13 }}>No</span>}</td>
+                  {/* CDE */}
+                  <td style={{ padding: '10px 14px', textAlign: 'center' }}>
+                    {col.is_cde
+                      ? <span style={{ fontSize: 10, fontWeight: 700, background: '#D71E2B', color: 'white', padding: '2px 7px', borderRadius: 4 }}>CDE</span>
+                      : <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>—</span>}
+                  </td>
+                  {/* Info Classification */}
+                  <td style={{ padding: '10px 14px' }}>
+                    {(() => {
+                      const ic = col.info_classification
+                      const colors: Record<string, string> = { Public: '#1A7F4B', Internal: '#1D4ED8', Confidential: '#B45309', Restricted: '#D71E2B' }
+                      const bg: Record<string, string>     = { Public: '#EAF7F0', Internal: '#EFF6FF', Confidential: '#FFF7ED', Restricted: '#FEF2F2' }
+                      return ic
+                        ? <span style={{ fontSize: 10, fontWeight: 600, color: colors[ic] || '#4A4A4A', background: bg[ic] || '#F5F5F5', padding: '2px 7px', borderRadius: 4, border: `0.5px solid ${colors[ic] || '#ccc'}40` }}>{ic}</span>
+                        : <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>—</span>
+                    })()}
+                  </td>
+                  {/* PII Classification */}
+                  <td style={{ padding: '10px 14px' }}>
+                    {(() => {
+                      const pc = col.pii_classification
+                      const colors: Record<string, string> = { PII: '#D71E2B', Sensitive: '#B45309', 'Non-PII': '#4A4A4A' }
+                      const bg: Record<string, string>     = { PII: '#FEF2F2', Sensitive: '#FFF7ED', 'Non-PII': '#F5F5F5' }
+                      return pc && pc !== 'Non-PII'
+                        ? <span style={{ fontSize: 10, fontWeight: 600, color: colors[pc], background: bg[pc], padding: '2px 7px', borderRadius: 4, border: `0.5px solid ${colors[pc]}40` }}>{pc}</span>
+                        : <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>Non-PII</span>
+                    })()}
+                  </td>
                   <td style={{ padding: '10px 14px' }}><Badge variant={col.sensitivity as any} label={col.sensitivity} /></td>
                   <td style={{ padding: '10px 14px', fontSize: 13, color: col.missing_pct > 10 ? 'var(--wf-red)' : 'var(--ink-2)' }}>{col.missing_pct.toFixed(1)}%</td>
                   <td style={{ padding: '10px 14px' }}>
                     <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
                       {col.top_values?.slice(0, 3).map(tv => (
-                        <span key={tv.value} style={{ fontSize: 11, background: 'var(--surface-3)', padding: '1px 6px', borderRadius: 3, color: 'var(--ink-2)' }}>{tv.value}</span>
+                        <span key={tv.value} style={{ fontSize: 11, background: 'var(--surface-3)', padding: '1px 6px', borderRadius: 3, color: 'var(--ink-2)' }}>{String(tv.value)}</span>
                       ))}
                       {col.min != null && !col.top_values && <span style={{ fontSize: 11, color: 'var(--ink-3)' }}>{col.min} – {col.max}</span>}
                     </div>

@@ -62,7 +62,7 @@ export default function ProfilePage({ params }: { params: Promise<{ id: string }
 
   // ── Tabs per modality ────────────────────────────────
   const tabs = isStructured
-    ? ['overview', 'sample', 'variables', 'missing', 'correlations', 'interactions', 'dictionary', 'duplicates', 'intelligence', 'dq_checks']
+    ? ['overview', 'sample', 'dictionary', 'variables', 'missing', 'correlations', 'interactions', 'duplicates', 'intelligence', 'dq_checks']
     : isSemiStructured
     ? ['overview', 'sample', 'schema', 'variables', 'missing', 'heatmap', 'dictionary']
     : ['overview', 'elements', 'summary', 'obligations', 'dictionary', 'regulatory']
@@ -183,7 +183,7 @@ export default function ProfilePage({ params }: { params: Promise<{ id: string }
             { label: 'Total Rows',       value: profile.row_count?.toLocaleString() || '—',   sub: 'records' },
             { label: 'Total Columns',    value: profile.column_count?.toString() || '—',       sub: 'fields' },
             { label: 'Duplicate Rows',   value: profile.duplicate_row_count?.toString() || '0', sub: 'exact duplicates', alert: (profile.duplicate_row_count || 0) > 0 },
-            { label: 'PII Columns',      value: profile.columns.filter(c => c.is_pii).length.toString(), sub: 'flagged', alert: profile.columns.some(c => c.is_pii) },
+            { label: 'PII Columns',      value: profile.columns.filter(c => c.pii_classification === 'PII' || (!c.pii_classification && c.is_pii)).length.toString(), sub: 'flagged', alert: profile.columns.some(c => c.pii_classification === 'PII' || (!c.pii_classification && c.is_pii)) },
             { label: 'Missing Data',     value: profile.columns.filter(c => c.missing_pct > 0).length.toString(), sub: 'columns affected', alert: profile.columns.some(c => c.missing_pct > 10) },
           ].map((stat: any) => (
             <div key={stat.label} style={{
