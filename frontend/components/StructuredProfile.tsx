@@ -1856,7 +1856,7 @@ export default function StructuredProfile({ profile, activeTab }: Props) {
         </div>
 
         {/* Narrative body */}
-        <div style={{ padding: '28px 32px' }}>
+        <div style={{ padding: '28px 32px', maxHeight: 520, overflowY: 'auto' }}>
           {profile.raw_llm_narrative
             .split(/\n+/)
             .filter(line => line.trim())

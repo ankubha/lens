@@ -83,6 +83,8 @@ export default function SemiStructuredProfile({ profile, activeTab }: Props) {
               color: 'var(--ink-2)',
               lineHeight: 1.8,
               whiteSpace: 'pre-wrap' as const,
+              maxHeight: 440,
+              overflowY: 'auto',
             }}>
               {profile.raw_llm_narrative}
             </div>
