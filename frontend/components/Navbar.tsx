@@ -13,13 +13,37 @@ export default function Navbar() {
     && window.location.search.includes('tab=dataforge')
 
   const goTo = (tab: string) => {
-    if (pathname !== '/') {
-      router.push(`/?tab=${tab}`)
+    if (tab === 'dataforge') {
+      // Save current URL so we can return to it (e.g. a profile results page)
+      if (typeof window !== 'undefined' && pathname !== '/') {
+        sessionStorage.setItem('profilerReturnUrl', window.location.href)
+      }
+      if (pathname !== '/') {
+        router.push('/?tab=dataforge')
+      } else {
+        const url = new URL(window.location.href)
+        url.searchParams.set('tab', 'dataforge')
+        window.history.pushState({}, '', url)
+        window.dispatchEvent(new Event('tabchange'))
+      }
     } else {
-      const url = new URL(window.location.href)
-      url.searchParams.set('tab', tab)
-      window.history.pushState({}, '', url)
-      window.dispatchEvent(new Event('tabchange'))
+      // Switching back to profiler — restore profile page if we came from one
+      const returnUrl = typeof window !== 'undefined'
+        ? sessionStorage.getItem('profilerReturnUrl')
+        : null
+      if (returnUrl) {
+        sessionStorage.removeItem('profilerReturnUrl')
+        router.push(returnUrl)
+        return
+      }
+      if (pathname !== '/') {
+        router.push('/?tab=profiler')
+      } else {
+        const url = new URL(window.location.href)
+        url.searchParams.set('tab', 'profiler')
+        window.history.pushState({}, '', url)
+        window.dispatchEvent(new Event('tabchange'))
+      }
     }
   }
 

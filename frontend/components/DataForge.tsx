@@ -1,5 +1,15 @@
 'use client'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+
+const STORAGE_KEY = 'dataforge_state'
+
+function loadSaved(): Record<string, any> | null {
+  if (typeof window === 'undefined') return null
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch { return null }
+}
 
 interface Column {
   name: string
@@ -18,6 +28,14 @@ interface Table {
   name: string
   row_count: number
   columns: Column[]
+}
+
+interface NoiseRule {
+  table: string
+  column: string
+  noise_type: string
+  rate: number
+  description: string
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
@@ -44,14 +62,42 @@ const inputStyle: React.CSSProperties = {
   outline: 'none',
 }
 
+const NOISE_TYPE_COLORS: Record<string, string> = {
+  null:          '#6366f1',
+  malformed:     '#ef4444',
+  out_of_range:  '#f97316',
+  negative:      '#eab308',
+  typo:          '#8b5cf6',
+  whitespace:    '#06b6d4',
+  wrong_type:    '#ec4899',
+  future_date:   '#14b8a6',
+  special_chars: '#f43f5e',
+  duplicate:     '#84cc16',
+}
+
 export default function DataForge() {
-  const [prompt, setPrompt]               = useState('')
-  const [tables, setTables]               = useState<Table[]>([])
+  const [prompt, setPrompt]               = useState<string>(() => loadSaved()?.prompt ?? '')
+  const [tables, setTables]               = useState<Table[]>(() => loadSaved()?.tables ?? [])
+  const [step, setStep]                   = useState<'prompt' | 'schema' | 'done'>(() => {
+    const s = loadSaved()?.step
+    // 'done' can't be restored (blob URLs are gone) — fall back to 'schema' if tables exist
+    if (s === 'done') return 'schema'
+    return s ?? 'prompt'
+  })
+  const [noisePrompt, setNoisePrompt]     = useState<string>(() => loadSaved()?.noisePrompt ?? '')
+  const [showNoise, setShowNoise]         = useState<boolean>(() => loadSaved()?.showNoise ?? false)
+  const [noiseRules, setNoiseRules]       = useState<NoiseRule[]>(() => loadSaved()?.noiseRules ?? [])
   const [generating, setGenerating]       = useState(false)
   const [downloading, setDownloading]     = useState(false)
-  const [step, setStep]                   = useState<'prompt' | 'schema' | 'done'>('prompt')
   const [generatedFiles, setGeneratedFiles] = useState<{ name: string; url: string }[]>([])
   const [error, setError]                 = useState('')
+
+  // Persist to sessionStorage whenever meaningful state changes
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ prompt, tables, step, noisePrompt, showNoise, noiseRules }))
+    } catch {}
+  }, [prompt, tables, step, noisePrompt, showNoise, noiseRules])
 
   // ── Schema generation ─────────────────────────────────
   const generateSchema = async () => {
@@ -83,7 +129,10 @@ export default function DataForge() {
       const res = await fetch(`${API_BASE}/api/dataforge/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tables }),
+        body: JSON.stringify({
+          tables,
+          noise_prompt: noisePrompt.trim() || null,
+        }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Generation failed')
@@ -93,6 +142,7 @@ export default function DataForge() {
         return { name: `${t.name}.csv`, url }
       })
       setGeneratedFiles(files)
+      setNoiseRules(data.noise_rules || [])
       setStep('done')
     } catch (e: any) {
       setError(e.message)
@@ -110,27 +160,22 @@ export default function DataForge() {
     }])
   }
 
-  const removeTable = (id: string) =>
-    setTables(prev => prev.filter(t => t.id !== id))
-
-  const updateTable = (id: string, updates: Partial<Table>) =>
+  const removeTable    = (id: string) => setTables(prev => prev.filter(t => t.id !== id))
+  const updateTable    = (id: string, updates: Partial<Table>) =>
     setTables(prev => prev.map(t => t.id === id ? { ...t, ...updates } : t))
-
-  const addColumn = (tableId: string) =>
+  const addColumn      = (tableId: string) =>
     setTables(prev => prev.map(t =>
       t.id === tableId
         ? { ...t, columns: [...t.columns, { name: 'new_column', type: 'string' as const, is_pk: false }] }
         : t
     ))
-
-  const updateColumn = (tableId: string, colIdx: number, updates: Partial<Column>) =>
+  const updateColumn   = (tableId: string, colIdx: number, updates: Partial<Column>) =>
     setTables(prev => prev.map(t =>
       t.id === tableId
         ? { ...t, columns: t.columns.map((c, i) => i === colIdx ? { ...c, ...updates } : c) }
         : t
     ))
-
-  const removeColumn = (tableId: string, colIdx: number) =>
+  const removeColumn   = (tableId: string, colIdx: number) =>
     setTables(prev => prev.map(t =>
       t.id === tableId
         ? { ...t, columns: t.columns.filter((_, i) => i !== colIdx) }
@@ -224,7 +269,6 @@ export default function DataForge() {
               resize: 'vertical' as const, lineHeight: 1.6,
               boxSizing: 'border-box' as const,
               boxShadow: '0 0 0 3px rgba(215,30,43,0.08)',
-              transition: 'border-color 0.15s ease, box-shadow 0.15s ease',
             }}
             onFocus={e => {
               e.target.style.borderColor = 'var(--wf-red)'
@@ -266,9 +310,9 @@ export default function DataForge() {
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {[
-                { label: 'Banking', desc: 'Loan portfolio with customers, loans, and payments tables' },
+                { label: 'Banking',    desc: 'Loan portfolio with customers, loans, and payments tables' },
                 { label: 'E-commerce', desc: 'Products, orders, order_items, and customers with FK chain' },
-                { label: 'HR', desc: 'Departments, employees, salaries, and performance reviews' },
+                { label: 'HR',         desc: 'Departments, employees, salaries, and performance reviews' },
               ].map(ex => (
                 <button
                   key={ex.label}
@@ -279,7 +323,7 @@ export default function DataForge() {
                     border: '0.5px solid var(--border-1)',
                     background: 'var(--surface-2)', color: 'var(--ink)',
                     cursor: 'pointer', fontFamily: 'var(--font-body)',
-                    textAlign: 'left', transition: 'all 0.15s ease',
+                    textAlign: 'left',
                   }}
                   onMouseEnter={e => {
                     (e.currentTarget as HTMLButtonElement).style.background = 'var(--wf-red-light)'
@@ -290,14 +334,9 @@ export default function DataForge() {
                     ;(e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--border-1)'
                   }}
                 >
-                  <div style={{
-                    width: 6, height: 6, borderRadius: '50%',
-                    background: 'var(--wf-red)', flexShrink: 0,
-                  }}/>
+                  <div style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--wf-red)', flexShrink: 0 }}/>
                   <div>
-                    <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--wf-red)', marginRight: 8 }}>
-                      {ex.label}
-                    </span>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--wf-red)', marginRight: 8 }}>{ex.label}</span>
                     <span style={{ fontSize: 12, color: 'var(--ink-2)' }}>{ex.desc}</span>
                   </div>
                 </button>
@@ -325,7 +364,7 @@ export default function DataForge() {
             </div>
             <div style={{ display: 'flex', gap: 10 }}>
               <button
-                onClick={() => { setStep('prompt'); setTables([]) }}
+                onClick={() => { sessionStorage.removeItem(STORAGE_KEY); setStep('prompt'); setTables([]); setNoisePrompt(''); setShowNoise(false) }}
                 style={{
                   padding: '8px 16px', borderRadius: 'var(--radius-md)',
                   background: 'transparent', color: 'var(--ink-2)',
@@ -358,7 +397,9 @@ export default function DataForge() {
                   fontFamily: 'var(--font-body)',
                 }}
               >
-                {downloading ? 'Generating...' : '⬇ Generate & Download'}
+                {downloading
+                  ? (noisePrompt.trim() ? 'Applying noise...' : 'Generating...')
+                  : '⬇ Generate & Download'}
               </button>
             </div>
           </div>
@@ -413,7 +454,7 @@ export default function DataForge() {
                 </button>
               </div>
 
-              {/* Columns table */}
+              {/* Columns */}
               <table style={{ width: '100%', borderCollapse: 'collapse' as const }}>
                 <thead>
                   <tr style={{ background: 'var(--surface-2)' }}>
@@ -432,8 +473,6 @@ export default function DataForge() {
                 <tbody>
                   {table.columns.map((col, ci) => (
                     <tr key={ci} style={{ borderBottom: '0.5px solid var(--border-1)' }}>
-
-                      {/* Column name */}
                       <td style={{ padding: '8px 12px' }}>
                         <input
                           value={col.name}
@@ -441,8 +480,6 @@ export default function DataForge() {
                           style={{ ...inputStyle, width: 150 }}
                         />
                       </td>
-
-                      {/* Type */}
                       <td style={{ padding: '8px 12px' }}>
                         <select
                           value={col.type}
@@ -454,8 +491,6 @@ export default function DataForge() {
                           ))}
                         </select>
                       </td>
-
-                      {/* PK */}
                       <td style={{ padding: '8px 12px', textAlign: 'center' as const }}>
                         <input
                           type="checkbox"
@@ -463,8 +498,6 @@ export default function DataForge() {
                           onChange={e => updateColumn(table.id, ci, { is_pk: e.target.checked })}
                         />
                       </td>
-
-                      {/* FK table */}
                       <td style={{ padding: '8px 12px' }}>
                         <select
                           value={col.fk_table || ''}
@@ -477,8 +510,6 @@ export default function DataForge() {
                           ))}
                         </select>
                       </td>
-
-                      {/* FK column */}
                       <td style={{ padding: '8px 12px' }}>
                         <input
                           value={col.fk_column || ''}
@@ -488,8 +519,6 @@ export default function DataForge() {
                           style={{ ...inputStyle, width: 100, opacity: col.fk_table ? 1 : 0.4 }}
                         />
                       </td>
-
-                      {/* Options */}
                       <td style={{ padding: '8px 12px' }}>
                         {col.type === 'categorical' && (
                           <input
@@ -506,18 +535,14 @@ export default function DataForge() {
                             <input
                               type="number"
                               value={col.min ?? ''}
-                              onChange={e => updateColumn(table.id, ci, {
-                                min: e.target.value ? Number(e.target.value) : undefined,
-                              })}
+                              onChange={e => updateColumn(table.id, ci, { min: e.target.value ? Number(e.target.value) : undefined })}
                               placeholder="min"
                               style={{ ...inputStyle, width: 70 }}
                             />
                             <input
                               type="number"
                               value={col.max ?? ''}
-                              onChange={e => updateColumn(table.id, ci, {
-                                max: e.target.value ? Number(e.target.value) : undefined,
-                              })}
+                              onChange={e => updateColumn(table.id, ci, { max: e.target.value ? Number(e.target.value) : undefined })}
                               placeholder="max"
                               style={{ ...inputStyle, width: 70 }}
                             />
@@ -527,8 +552,6 @@ export default function DataForge() {
                           <span style={{ fontSize: 11, color: 'var(--ink-3)' }}>—</span>
                         )}
                       </td>
-
-                      {/* Remove */}
                       <td style={{ padding: '8px 12px' }}>
                         {!col.is_pk && (
                           <button
@@ -543,13 +566,11 @@ export default function DataForge() {
                           </button>
                         )}
                       </td>
-
                     </tr>
                   ))}
                 </tbody>
               </table>
 
-              {/* Add column */}
               <div style={{ padding: '10px 12px', borderTop: '0.5px solid var(--border-1)' }}>
                 <button
                   onClick={() => addColumn(table.id)}
@@ -565,6 +586,110 @@ export default function DataForge() {
               </div>
             </div>
           ))}
+
+          {/* ── Noise Configuration ── */}
+          <div style={{
+            border: '0.5px solid var(--border-1)',
+            borderRadius: 'var(--radius-lg)',
+            overflow: 'hidden',
+            boxShadow: 'var(--shadow-sm)',
+          }}>
+            {/* Noise header / toggle */}
+            <button
+              onClick={() => setShowNoise(v => !v)}
+              style={{
+                width: '100%', display: 'flex', alignItems: 'center', gap: 12,
+                padding: '14px 16px',
+                background: showNoise ? 'rgba(99,102,241,0.06)' : 'var(--surface-2)',
+                border: 'none', borderBottom: showNoise ? '0.5px solid var(--border-1)' : 'none',
+                cursor: 'pointer', fontFamily: 'var(--font-body)', textAlign: 'left' as const,
+              }}
+            >
+              <div style={{
+                width: 28, height: 28, borderRadius: 6,
+                background: showNoise ? '#6366f1' : 'var(--surface-3)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: 14, flexShrink: 0, transition: 'background 0.15s',
+              }}>
+                🧪
+              </div>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)' }}>
+                  Inject Noise&nbsp;
+                  <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--ink-3)' }}>(optional)</span>
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--ink-3)', marginTop: 2 }}>
+                  {noisePrompt.trim()
+                    ? `Noise prompt set — AI will generate rules`
+                    : 'Leave empty for clean, perfect data'}
+                </div>
+              </div>
+              <span style={{ fontSize: 13, color: 'var(--ink-3)', transform: showNoise ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }}>
+                ▾
+              </span>
+            </button>
+
+            {showNoise && (
+              <div style={{ padding: '20px 16px', background: 'var(--surface)' }}>
+                <div style={{ fontSize: 12, color: 'var(--ink-2)', marginBottom: 10, lineHeight: 1.6 }}>
+                  Describe in plain English exactly what noise you want — which table, which column,
+                  what type of corruption, and what percentage of rows should be affected.
+                  The AI interprets your description and generates precise rules. One API call only.
+                </div>
+
+                <textarea
+                  value={noisePrompt}
+                  onChange={e => setNoisePrompt(e.target.value)}
+                  placeholder={
+                    'Examples:\n' +
+                    '• Make 15% of emails in customers malformed (missing @ symbol)\n' +
+                    '• Add 10% null values to the credit_score column in customers\n' +
+                    '• Put negative amounts in 5% of the loans table\n' +
+                    '• Inject typos in 20% of name values across customers\n' +
+                    '• Duplicate 8% of rows in the payments table\n' +
+                    '• Add special characters to 12% of the description column\n' +
+                    '• Mix all of the above across different columns'
+                  }
+                  style={{
+                    width: '100%', height: 160, padding: '12px 14px',
+                    borderRadius: 'var(--radius-md)',
+                    border: '1.5px solid #6366f1',
+                    fontSize: 12.5, color: 'var(--ink)', background: 'var(--surface)',
+                    fontFamily: 'var(--font-body)', outline: 'none',
+                    resize: 'vertical' as const, lineHeight: 1.7,
+                    boxSizing: 'border-box' as const,
+                    boxShadow: '0 0 0 3px rgba(99,102,241,0.08)',
+                  }}
+                  onFocus={e => { e.target.style.boxShadow = '0 0 0 4px rgba(99,102,241,0.14)' }}
+                  onBlur={e => { e.target.style.boxShadow = '0 0 0 3px rgba(99,102,241,0.08)' }}
+                />
+
+                {noisePrompt.trim() && (
+                  <div style={{
+                    marginTop: 10, padding: '8px 12px',
+                    background: 'rgba(99,102,241,0.06)',
+                    border: '0.5px solid rgba(99,102,241,0.2)',
+                    borderRadius: 'var(--radius-md)',
+                    fontSize: 12, color: '#6366f1',
+                  }}>
+                    ✓ Noise prompt ready — rules will be generated on "Generate & Download"
+                  </div>
+                )}
+
+                <button
+                  onClick={() => setNoisePrompt('')}
+                  style={{
+                    marginTop: 8, fontSize: 11, color: 'var(--ink-3)',
+                    background: 'none', border: 'none',
+                    cursor: 'pointer', fontFamily: 'var(--font-body)',
+                    textDecoration: 'underline',
+                  }}
+                >
+                  Clear noise prompt
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -572,58 +697,139 @@ export default function DataForge() {
           STEP 3 — DOWNLOAD
       ══════════════════════════════════════════════════ */}
       {step === 'done' && (
-        <div style={{
-          background: 'var(--surface)',
-          border: '0.5px solid var(--border-1)',
-          borderRadius: 'var(--radius-xl)',
-          padding: '48px',
-          textAlign: 'center' as const,
-          boxShadow: 'var(--shadow-md)',
-        }}>
-          <div style={{ fontSize: 48, marginBottom: 16 }}>🎉</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+          {/* Success card */}
           <div style={{
-            fontSize: 22, fontWeight: 700,
-            color: 'var(--ink)', marginBottom: 8,
-            fontFamily: 'var(--font-display)',
+            background: 'var(--surface)',
+            border: '0.5px solid var(--border-1)',
+            borderRadius: 'var(--radius-xl)',
+            padding: '40px 48px',
+            textAlign: 'center' as const,
+            boxShadow: 'var(--shadow-md)',
           }}>
-            Data generated successfully
+            <div style={{ fontSize: 44, marginBottom: 12 }}>🎉</div>
+            <div style={{
+              fontSize: 22, fontWeight: 700,
+              color: 'var(--ink)', marginBottom: 8,
+              fontFamily: 'var(--font-display)',
+            }}>
+              Data generated successfully
+            </div>
+            <p style={{ fontSize: 14, color: 'var(--ink-2)', marginBottom: 24 }}>
+              {totalRows.toLocaleString()} rows across {tables.length} tables with full referential integrity
+              {noiseRules.length > 0 && ` · ${noiseRules.length} noise rule${noiseRules.length > 1 ? 's' : ''} applied`}
+            </p>
+            <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' as const }}>
+              {generatedFiles.map(f => (
+                <a
+                  key={f.name}
+                  href={f.url}
+                  download={f.name}
+                  style={{
+                    padding: '10px 20px', borderRadius: 'var(--radius-md)',
+                    background: 'var(--wf-red)', color: 'white',
+                    textDecoration: 'none', fontSize: 13, fontWeight: 500,
+                    display: 'flex', alignItems: 'center', gap: 8,
+                  }}
+                >
+                  ⬇ {f.name}
+                </a>
+              ))}
+            </div>
+            <button
+              onClick={() => {
+                sessionStorage.removeItem(STORAGE_KEY)
+                setStep('prompt')
+                setPrompt('')
+                setTables([])
+                setGeneratedFiles([])
+                setNoisePrompt('')
+                setNoiseRules([])
+                setShowNoise(false)
+              }}
+              style={{
+                marginTop: 18, fontSize: 13, color: 'var(--wf-red)',
+                background: 'none', border: 'none',
+                cursor: 'pointer', textDecoration: 'underline',
+                fontFamily: 'var(--font-body)',
+              }}
+            >
+              Generate another dataset
+            </button>
           </div>
-          <p style={{ fontSize: 14, color: 'var(--ink-2)', marginBottom: 28 }}>
-            {totalRows.toLocaleString()} rows across {tables.length} tables with full referential integrity
-          </p>
-          <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' as const }}>
-            {generatedFiles.map(f => (
-              <a
-                key={f.name}
-                href={f.url}
-                download={f.name}
-                style={{
-                  padding: '10px 20px', borderRadius: 'var(--radius-md)',
-                  background: 'var(--wf-red)', color: 'white',
-                  textDecoration: 'none', fontSize: 13, fontWeight: 500,
-                  display: 'flex', alignItems: 'center', gap: 8,
-                }}
-              >
-                ⬇ {f.name}
-              </a>
-            ))}
-          </div>
-          <button
-            onClick={() => {
-              setStep('prompt')
-              setPrompt('')
-              setTables([])
-              setGeneratedFiles([])
-            }}
-            style={{
-              marginTop: 20, fontSize: 13, color: 'var(--wf-red)',
-              background: 'none', border: 'none',
-              cursor: 'pointer', textDecoration: 'underline',
-              fontFamily: 'var(--font-body)',
-            }}
-          >
-            Generate another dataset
-          </button>
+
+          {/* Noise rules breakdown */}
+          {noiseRules.length > 0 && (
+            <div style={{
+              background: 'var(--surface)',
+              border: '0.5px solid rgba(99,102,241,0.3)',
+              borderRadius: 'var(--radius-lg)',
+              overflow: 'hidden',
+              boxShadow: 'var(--shadow-sm)',
+            }}>
+              <div style={{
+                padding: '12px 16px',
+                background: 'rgba(99,102,241,0.06)',
+                borderBottom: '0.5px solid rgba(99,102,241,0.15)',
+                display: 'flex', alignItems: 'center', gap: 10,
+              }}>
+                <span style={{ fontSize: 15 }}>🧪</span>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)' }}>
+                    Noise rules applied
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 1 }}>
+                    {noiseRules.length} rule{noiseRules.length > 1 ? 's' : ''} interpreted from your prompt
+                  </div>
+                </div>
+              </div>
+              <div style={{ padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {noiseRules.map((rule, i) => (
+                  <div key={i} style={{
+                    display: 'flex', alignItems: 'flex-start', gap: 10,
+                    padding: '10px 12px',
+                    background: 'var(--surface-2)',
+                    borderRadius: 'var(--radius-md)',
+                    border: '0.5px solid var(--border-1)',
+                  }}>
+                    {/* noise type badge */}
+                    <div style={{
+                      padding: '2px 8px',
+                      borderRadius: 20,
+                      fontSize: 10, fontWeight: 600,
+                      letterSpacing: '0.04em',
+                      textTransform: 'uppercase' as const,
+                      flexShrink: 0,
+                      background: (NOISE_TYPE_COLORS[rule.noise_type] || '#888') + '22',
+                      color: NOISE_TYPE_COLORS[rule.noise_type] || '#888',
+                      border: `0.5px solid ${(NOISE_TYPE_COLORS[rule.noise_type] || '#888')}44`,
+                    }}>
+                      {rule.noise_type.replace(/_/g, ' ')}
+                    </div>
+                    {/* target */}
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--ink)', marginBottom: 2 }}>
+                        <span style={{ color: 'var(--wf-red)' }}>{rule.table}</span>
+                        <span style={{ color: 'var(--ink-3)', margin: '0 4px' }}>›</span>
+                        <span>{rule.column === '__row__' ? '(entire row)' : rule.column === '__all__' ? 'all columns' : rule.column}</span>
+                      </div>
+                      <div style={{ fontSize: 11, color: 'var(--ink-3)' }}>
+                        {rule.description}
+                      </div>
+                    </div>
+                    {/* rate */}
+                    <div style={{
+                      fontSize: 11, fontWeight: 600,
+                      color: 'var(--ink-2)', flexShrink: 0,
+                    }}>
+                      {Math.round(rule.rate * 100)}% of rows
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

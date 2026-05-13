@@ -992,6 +992,7 @@ def get_scan_result(profile_id: str):
 
 # ── DataForge ─────────────────────────────────────────────
 
+from typing import Optional as _Optional
 from backend.core.dataforge import generate_schema_from_prompt, generate_all_tables
 from pydantic import BaseModel as PydanticBase
 
@@ -1000,6 +1001,7 @@ class SchemaPromptRequest(PydanticBase):
 
 class GenerateDataRequest(PydanticBase):
     tables: list[dict]
+    noise_prompt: _Optional[str] = None
 
 @router.post("/dataforge/schema")
 def dataforge_schema(request: SchemaPromptRequest):
@@ -1012,9 +1014,9 @@ def dataforge_schema(request: SchemaPromptRequest):
 
 @router.post("/dataforge/generate")
 def dataforge_generate(request: GenerateDataRequest):
-    """Generate synthetic data for all tables with referential integrity."""
+    """Generate synthetic data for all tables with referential integrity. Optionally injects noise."""
     try:
-        results = generate_all_tables(request.tables)
-        return {"tables": results}
+        results, noise_rules = generate_all_tables(request.tables, request.noise_prompt)
+        return {"tables": results, "noise_rules": noise_rules}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
