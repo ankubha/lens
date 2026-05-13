@@ -30,12 +30,34 @@ class DocumentType(str, Enum):
     # Semi-structured
     JSON = "json"
     XML = "xml"
-    # Unstructured
+    # Unstructured — Lending & Credit
     COMMERCIAL_LOAN = "commercial_loan"
+    CREDIT_AGREEMENT = "credit_agreement"
+    TERM_LOAN = "term_loan"
+    REVOLVING_CREDIT = "revolving_credit"
+    PROMISSORY_NOTE = "promissory_note"
+    MORTGAGE = "mortgage"
+    GUARANTEE = "guarantee"
+    SECURITY_AGREEMENT = "security_agreement"
+    INTERCREDITOR_AGREEMENT = "intercreditor_agreement"
+    # Unstructured — Deal Docs
     TERM_SHEET = "term_sheet"
     CREDIT_MEMO = "credit_memo"
-    FINANCIAL_STATEMENT = "financial_statement"
+    AMENDMENT = "amendment"
+    WAIVER = "waiver"
+    # Unstructured — Corporate / Legal
     MSA = "master_service_agreement"
+    NDA = "non_disclosure_agreement"
+    EMPLOYMENT_AGREEMENT = "employment_agreement"
+    # Unstructured — Financial Reports
+    FINANCIAL_STATEMENT = "financial_statement"
+    AUDIT_REPORT = "audit_report"
+    COMPLIANCE_REPORT = "compliance_report"
+    PROSPECTUS = "prospectus"
+    REGULATORY_FILING = "regulatory_filing"
+    BOARD_MINUTES = "board_minutes"
+    RISK_ASSESSMENT = "risk_assessment"
+    # Generic
     GENERIC_PDF = "generic_pdf"
     UNKNOWN = "unknown"
 

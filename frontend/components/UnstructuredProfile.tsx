@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { ProfileContract, ExtractedFact, DiscoveredField } from '@/lib/api'
 import Badge from './Badge'
 
@@ -607,6 +607,9 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
   const [pageError, setPageError]         = useState('')
   const [fryResults, setFryResults]       = useState<any>(null)
   const [fryFilter, setFryFilter]         = useState('all')
+  const [mounted, setMounted]             = useState(false)
+
+  useEffect(() => { setMounted(true) }, [])
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'
 
@@ -630,197 +633,247 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
     }
   }
 
-  // Show top CDEs on overview: prefer core fields, then any with values
-  const coreCDEs = profile.critical_data_elements?.filter(f =>
-    f.value && f.is_cde
-  ) || []
-  const overviewCDEs = coreCDEs.slice(0, 8)
+  // Show top CDEs on overview: prefer is_cde=true, fall back to any with values
+  const allFacts  = profile.critical_data_elements ?? []
+  const coreCDEs  = allFacts.filter(f => f.value && f.is_cde)
+  const overviewCDEs = (coreCDEs.length > 0
+    ? coreCDEs
+    : allFacts.filter(f => f.value)
+  ).slice(0, 8)
 
   // ── OVERVIEW ──────────────────────────────────────────
   if (activeTab === 'overview') {
+    if (!mounted) return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {[1,2].map(i => (
+          <div key={i} style={{ height: 120, borderRadius: 'var(--radius-lg)', background: 'var(--surface-2)', border: '0.5px solid var(--border-1)', animation: 'pulse 1.5s ease-in-out infinite' }}/>
+        ))}
+        <style>{`@keyframes pulse { 0%,100%{opacity:0.6} 50%{opacity:1} }`}</style>
+      </div>
+    )
+
+    const hasSections = (profile.sections_detected?.length ?? 0) > 0
+    const hasParties  = (profile.parties?.length ?? 0) > 0
+    const sections    = profile.sections_detected ?? []
+    const parties     = profile.parties ?? []
+
+    const partyIcon = (name: string) => {
+      const n = name.toLowerCase()
+      if (n.includes('lend') || n.includes('bank'))   return { icon: 'LB', bg: '#1D4ED8', fg: 'white' }
+      if (n.includes('borrow') || n.includes('debtor'))return { icon: 'BR', bg: '#7C3AED', fg: 'white' }
+      if (n.includes('agent') || n.includes('admin')) return { icon: 'AG', bg: '#B45309', fg: 'white' }
+      if (n.includes('guarantor'))                     return { icon: 'GU', bg: '#1A7F4B', fg: 'white' }
+      return { icon: name.slice(0, 2).toUpperCase(), bg: 'var(--surface-3)', fg: 'var(--ink-2)' }
+    }
+
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
+        {/* ── ROW 1: Key extracted facts — individual cards with gold top ── */}
         {overviewCDEs.length > 0 && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
-            {overviewCDEs.map((fact, i) => {
-              const isFirst = i === 0
-              return (
-                <div key={i} style={{ background: isFirst ? 'var(--wf-red)' : 'var(--surface)', border: `0.5px solid ${isFirst ? 'var(--wf-red)' : 'var(--border-1)'}`, borderRadius: 'var(--radius-lg)', padding: '16px 20px', boxShadow: isFirst ? '0 4px 16px rgba(215,30,43,0.25)' : 'var(--shadow-sm)', borderTop: isFirst ? 'none' : '3px solid var(--wf-gold)', position: 'relative', overflow: 'hidden' }}>
-                  {isFirst && <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3, background: 'var(--wf-gold)' }}/>}
-                  <div style={{ fontSize: 11, color: isFirst ? 'rgba(255,255,255,0.7)' : 'var(--ink-3)', textTransform: 'capitalize', marginBottom: 6, letterSpacing: '0.03em' }}>
+            {overviewCDEs.slice(0, 8).map((fact, i) => (
+              <div key={i} style={{
+                background: 'var(--surface)',
+                border: '0.5px solid var(--border-1)',
+                borderRadius: 'var(--radius-lg)',
+                overflow: 'hidden',
+                boxShadow: '0 1px 4px rgba(0,0,0,0.06)',
+                display: 'flex',
+                flexDirection: 'column',
+              }}>
+                {/* Gold top bar */}
+                <div style={{
+                  height: 3,
+                  background: fact.pii_classification === 'PII'
+                    ? 'linear-gradient(90deg,#D71E2B,#AA1520)'
+                    : 'linear-gradient(90deg, var(--wf-gold), var(--wf-gold-dark))',
+                }}/>
+                <div style={{ padding: '14px 16px', flex: 1, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {/* Label */}
+                  <div style={{
+                    fontSize: 10, fontWeight: 600, color: 'var(--ink-3)',
+                    textTransform: 'uppercase', letterSpacing: '0.07em',
+                    lineHeight: 1.2,
+                  }}>
                     {fact.field_name.replace(/_/g, ' ')}
                   </div>
-                  <div style={{ fontSize: isFirst ? 22 : 15, fontWeight: 700, color: isFirst ? 'white' : 'var(--ink)', fontFamily: 'var(--font-display)', lineHeight: 1.2, wordBreak: 'break-word' }}>
+                  {/* Value */}
+                  <div style={{
+                    fontSize: 14, fontWeight: 700, color: 'var(--ink)',
+                    lineHeight: 1.35, wordBreak: 'break-word', flex: 1,
+                  }}>
                     {fact.value}
                   </div>
-                  {fact.provenance?.page && (
-                    <div style={{ fontSize: 10, color: isFirst ? 'rgba(255,205,65,0.9)' : 'var(--ink-3)', marginTop: 4 }}>p.{fact.provenance.page}</div>
-                  )}
+                  {/* Footer badges */}
+                  <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', alignItems: 'center' }}>
+                    {fact.provenance?.page && (
+                      <span style={{
+                        fontSize: 9, fontWeight: 600,
+                        color: 'var(--wf-gold-dark)', background: 'var(--wf-gold-light)',
+                        padding: '1px 6px', borderRadius: 4,
+                        border: '0.5px solid rgba(201,162,39,0.3)',
+                      }}>
+                        p.{fact.provenance.page}
+                      </span>
+                    )}
+                    {fact.pii_classification && fact.pii_classification !== 'Non-PII' && (
+                      <span style={{
+                        fontSize: 9, fontWeight: 700,
+                        color: 'var(--wf-red)', background: 'var(--wf-red-light)',
+                        padding: '1px 6px', borderRadius: 4,
+                        border: '0.5px solid rgba(215,30,43,0.2)',
+                      }}>
+                        {fact.pii_classification}
+                      </span>
+                    )}
+                    {fact.is_cde && (
+                      <span style={{
+                        fontSize: 9, fontWeight: 700,
+                        color: '#1D4ED8', background: '#EFF6FF',
+                        padding: '1px 6px', borderRadius: 4,
+                        border: '0.5px solid rgba(29,78,216,0.2)',
+                      }}>
+                        CDE
+                      </span>
+                    )}
+                  </div>
                 </div>
-              )
-            })}
-          </div>
-        )}
-
-        {/* Health score with four dimensions */}
-        {profile.health_breakdown && Object.keys(profile.health_breakdown).length > 0 && (
-          <HealthBreakdown breakdown={profile.health_breakdown} score={profile.health_score} />
-        )}
-
-        <Card title="Document Fingerprint">
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 0 }}>
-            {[
-              { label: 'Document Type',              value: profile.document_type.replace(/_/g, ' ') },
-              { label: 'Classification Confidence',  value: `${((profile.document_type_confidence || 0) * 100).toFixed(0)}%` },
-              { label: 'Language',                   value: profile.detected_language?.toUpperCase() || 'English' },
-              { label: 'Total Pages',                value: profile.page_count?.toString() || '—' },
-              { label: 'Scanned Document',           value: profile.is_scanned ? 'Yes (OCR applied)' : 'No (Native PDF)' },
-              { label: 'Contains Tables',            value: profile.has_tables ? 'Yes' : 'No' },
-            ].map((item, i) => (
-              <div key={item.label} style={{ padding: '16px 20px', borderBottom: i < 3 ? '0.5px solid var(--border-1)' : 'none', borderRight: (i + 1) % 3 !== 0 ? '0.5px solid var(--border-1)' : 'none' }}>
-                <div style={{ fontSize: 11, color: 'var(--ink-3)', marginBottom: 4 }}>{item.label}</div>
-                <div style={{ fontSize: 15, fontWeight: 500, color: 'var(--ink)' }}>{item.value}</div>
               </div>
             ))}
           </div>
-        </Card>
+        )}
 
-        {profile.sections_detected && profile.sections_detected.length > 0 && (() => {
-          const sections = profile.sections_detected
-          const articleCount = sections.filter(s => /^ARTICLE/i.test(s.trim())).length
-          const sectionCount = sections.filter(s => /^Section/i.test(s.trim())).length
+        {/* ── ROW 2: Structure (left) + Parties (right) ── */}
+        {(hasSections || hasParties) && (
+          <div style={{
+            display: 'grid',
+            gridTemplateColumns: hasSections && hasParties ? '3fr 2fr' : '1fr',
+            gap: 16,
+            alignItems: 'start',
+          }}>
 
-          return (
-            <div style={{
-              background: 'var(--surface)',
-              border: '0.5px solid var(--border-1)',
-              borderRadius: 'var(--radius-lg)',
-              overflow: 'hidden',
-              boxShadow: 'var(--shadow-sm)',
-            }}>
-              {/* Header */}
-              <div style={{
-                padding: '14px 20px',
-                borderBottom: '0.5px solid var(--border-1)',
-                background: 'var(--surface-2)',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 12,
-              }}>
-                <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Document Structure</span>
-                <div style={{ display: 'flex', gap: 6, marginLeft: 4 }}>
-                  {articleCount > 0 && (
-                    <span style={{ fontSize: 11, fontWeight: 500, padding: '2px 8px', borderRadius: 10, background: 'var(--wf-red-light)', color: 'var(--wf-red)', border: '0.5px solid rgba(215,30,43,0.2)' }}>
-                      {articleCount} {articleCount === 1 ? 'Article' : 'Articles'}
-                    </span>
-                  )}
-                  {sectionCount > 0 && (
-                    <span style={{ fontSize: 11, fontWeight: 500, padding: '2px 8px', borderRadius: 10, background: 'var(--wf-gold-light)', color: 'var(--wf-gold-dark)', border: '0.5px solid rgba(201,162,39,0.25)' }}>
-                      {sectionCount} {sectionCount === 1 ? 'Section' : 'Sections'}
-                    </span>
-                  )}
-                </div>
-                <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--ink-3)' }}>
-                  {sections.length} total
-                </span>
-              </div>
+            {/* Document Structure */}
+            {hasSections && (() => {
+              const articleCount = sections.filter(s => /^ARTICLE/i.test(s.trim())).length
+              const sectionCount = sections.filter(s => /^Section/i.test(s.trim())).length
+              return (
+                <div style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}>
+                  {/* Header */}
+                  <div style={{ padding: '12px 18px', borderBottom: '0.5px solid var(--border-1)', background: 'var(--surface-2)', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', flex: 1 }}>Document Structure</span>
+                    {articleCount > 0 && (
+                      <span style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 20, background: 'var(--wf-red-light)', color: 'var(--wf-red)', border: '0.5px solid rgba(215,30,43,0.18)' }}>
+                        {articleCount} {articleCount === 1 ? 'Article' : 'Articles'}
+                      </span>
+                    )}
+                    {sectionCount > 0 && (
+                      <span style={{ fontSize: 10, fontWeight: 600, padding: '2px 8px', borderRadius: 20, background: 'var(--wf-gold-light)', color: 'var(--wf-gold-dark)', border: '0.5px solid rgba(201,162,39,0.2)' }}>
+                        {sectionCount} {sectionCount === 1 ? 'Section' : 'Sections'}
+                      </span>
+                    )}
+                    <span style={{ fontSize: 10, color: 'var(--ink-3)', marginLeft: 4 }}>{sections.length} total</span>
+                  </div>
 
-              {/* Two-column grid */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr' }}>
-                {sections.map((s, i) => {
-                  const isArticle = /^ARTICLE/i.test(s.trim())
-                  const isSection = /^Section/i.test(s.trim())
-                  const m = s.match(/^((?:ARTICLE|Section)\s+[\w.]+)\s*[\-:—]?\s*(.*)/i)
-                  const prefix = m ? m[1].trim() : s.trim()
-                  const title  = m ? m[2].trim() : ''
-                  const isLastRow = i >= sections.length - (sections.length % 2 === 0 ? 2 : 1)
-                  const isRightCol = (i + 1) % 2 === 0
-
-                  return (
-                    <div key={i} style={{
-                      padding: '13px 20px',
-                      borderBottom: isLastRow ? 'none' : '0.5px solid var(--border-1)',
-                      borderRight: isRightCol ? 'none' : '0.5px solid var(--border-1)',
-                      display: 'flex',
-                      alignItems: 'flex-start',
-                      gap: 12,
-                      background: isArticle ? 'rgba(215,30,43,0.018)' : 'transparent',
-                    }}>
-                      {/* Index bubble */}
-                      <div style={{
-                        width: 24,
-                        height: 24,
-                        borderRadius: '50%',
-                        flexShrink: 0,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        fontSize: 10,
-                        fontWeight: 700,
-                        marginTop: 1,
-                        background: isArticle
-                          ? 'var(--wf-red)'
-                          : isSection
-                          ? 'var(--wf-gold-light)'
-                          : 'var(--surface-3)',
-                        color: isArticle
-                          ? 'white'
-                          : isSection
-                          ? 'var(--wf-gold-dark)'
-                          : 'var(--ink-3)',
-                        border: isSection ? '0.5px solid rgba(201,162,39,0.4)' : 'none',
-                      }}>
-                        {i + 1}
-                      </div>
-
-                      {/* Text */}
-                      <div style={{ minWidth: 0 }}>
-                        <div style={{
-                          fontSize: 12,
-                          fontWeight: 700,
-                          color: isArticle ? 'var(--wf-red)' : 'var(--ink)',
-                          letterSpacing: isArticle ? '0.04em' : '0.01em',
-                          textTransform: isArticle ? 'uppercase' as const : 'none' as const,
-                          lineHeight: 1.3,
+                  {/* Two-column section grid, scrollable */}
+                  <div style={{ maxHeight: 320, overflowY: 'auto', display: 'grid', gridTemplateColumns: '1fr 1fr' }}>
+                    {sections.map((s, i) => {
+                      const isArticle = /^ARTICLE/i.test(s.trim())
+                      const isSection = /^Section/i.test(s.trim())
+                      const m       = s.match(/^((?:ARTICLE|Section)\s+[\w.]+)\s*[\-:—]?\s*(.*)/i)
+                      const prefix  = m ? m[1].trim() : s.trim()
+                      const title   = m ? m[2].trim() : ''
+                      const cols    = 2
+                      const isLastRow = i >= sections.length - (sections.length % cols || cols)
+                      const isRight   = i % cols === cols - 1
+                      return (
+                        <div key={i} style={{
+                          padding: '9px 14px',
+                          borderBottom: isLastRow ? 'none' : '0.5px solid var(--border-1)',
+                          borderRight: isRight ? 'none' : '0.5px solid var(--border-1)',
+                          display: 'flex', gap: 8, alignItems: 'flex-start',
+                          background: isArticle ? 'rgba(215,30,43,0.018)' : 'transparent',
                         }}>
-                          {prefix}
-                        </div>
-                        {title && (
-                          <div style={{
-                            fontSize: 11,
-                            color: 'var(--ink-3)',
-                            marginTop: 3,
-                            lineHeight: 1.45,
-                            overflow: 'hidden',
-                            display: '-webkit-box',
-                            WebkitLineClamp: 2,
-                            WebkitBoxOrient: 'vertical' as const,
+                          <span style={{
+                            flexShrink: 0, width: 18, height: 18, borderRadius: '50%',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            fontSize: 8, fontWeight: 700, marginTop: 1,
+                            background: isArticle ? 'var(--wf-red)' : isSection ? 'rgba(201,162,39,0.15)' : 'var(--surface-3)',
+                            color: isArticle ? 'white' : isSection ? 'var(--wf-gold-dark)' : 'var(--ink-3)',
                           }}>
-                            {title}
+                            {i + 1}
+                          </span>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{
+                              fontSize: 11, fontWeight: 700, lineHeight: 1.3,
+                              color: isArticle ? 'var(--wf-red)' : 'var(--ink)',
+                              textTransform: isArticle ? 'uppercase' as const : 'none' as const,
+                              letterSpacing: isArticle ? '0.03em' : 0,
+                            }}>{prefix}</div>
+                            {title && (
+                              <div style={{ fontSize: 10, color: 'var(--ink-3)', marginTop: 1, lineHeight: 1.35,
+                                overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 1, WebkitBoxOrient: 'vertical' as const }}>
+                                {title}
+                              </div>
+                            )}
                           </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )
+            })()}
+
+            {/* Parties */}
+            {hasParties && (
+              <div style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}>
+                <div style={{ padding: '12px 18px', borderBottom: '0.5px solid var(--border-1)', background: 'var(--surface-2)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)' }}>Parties Identified</span>
+                  <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--wf-red)', background: 'var(--wf-red-light)', padding: '2px 8px', borderRadius: 20, border: '0.5px solid rgba(215,30,43,0.18)' }}>
+                    {parties.length}
+                  </span>
+                </div>
+                <div>
+                  {parties.map((party, i) => {
+                    const { icon, bg, fg } = partyIcon(party.field_name || '')
+                    return (
+                      <div key={i} style={{
+                        padding: '13px 18px',
+                        borderBottom: i < parties.length - 1 ? '0.5px solid var(--border-1)' : 'none',
+                        display: 'flex', gap: 12, alignItems: 'center',
+                      }}>
+                        <div style={{
+                          width: 36, height: 36, borderRadius: 10, flexShrink: 0,
+                          background: bg, color: fg,
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          fontSize: 11, fontWeight: 700, letterSpacing: '0.04em',
+                        }}>
+                          {icon}
+                        </div>
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>
+                            {party.field_name?.replace(/_/g, ' ')}
+                          </div>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {party.value
+                              ? party.value
+                              : <span style={{ color: 'var(--ink-3)', fontStyle: 'italic', fontWeight: 400, fontSize: 12 }}>Not identified</span>}
+                          </div>
+                        </div>
+                        {party.provenance?.page && (
+                          <span style={{ fontSize: 9, flexShrink: 0, color: 'var(--wf-gold-dark)', background: 'var(--wf-gold-light)', padding: '1px 6px', borderRadius: 3, fontWeight: 500 }}>
+                            p.{party.provenance.page}
+                          </span>
                         )}
                       </div>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
-          )
-        })()}
-
-        {profile.parties && profile.parties.length > 0 && (
-          <Card title="Parties Identified">
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 0 }}>
-              {profile.parties.map((party, i) => (
-                <div key={i} style={{ padding: '14px 20px', borderBottom: i < profile.parties!.length - 2 ? '0.5px solid var(--border-1)' : 'none', borderRight: (i + 1) % 2 !== 0 ? '0.5px solid var(--border-1)' : 'none' }}>
-                  <div style={{ fontSize: 11, color: 'var(--wf-red)', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 4 }}>{party.field_name}</div>
-                  <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--ink)' }}>{party.value}</div>
-                  {party.business_definition && <div style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 2 }}>{party.business_definition}</div>}
+                    )
+                  })}
                 </div>
-              ))}
-            </div>
-          </Card>
+              </div>
+            )}
+
+          </div>
         )}
 
       </div>
@@ -977,15 +1030,6 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
           </div>
         </Card>
 
-        {profile.raw_llm_narrative && (
-          <details style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', overflow: 'hidden', boxShadow: 'var(--shadow-sm)' }}>
-            <summary style={{ padding: '16px 20px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 10, listStyle: 'none', borderBottom: '0.5px solid var(--border-1)', background: 'var(--surface-2)' }}>
-              <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--ink)' }}>Free Narrative</span>
-              <Badge variant="neutral" label="Click to expand" />
-            </summary>
-            <div style={{ padding: '24px' }}><MarkdownText text={profile.raw_llm_narrative} fontSize={13} /></div>
-          </details>
-        )}
 
       </div>
     )
@@ -993,30 +1037,117 @@ function UnstructuredProfile({ profile, activeTab }: Props) {
 
   // ── OBLIGATIONS ──────────────────────────────────────
   if (activeTab === 'obligations') {
+    const obligations = profile.obligations ?? []
+
+    const obStyle = (type: string): { bg: string; border: string; color: string; icon: string } => {
+      const t = type.toLowerCase()
+      if (t.includes('financial'))   return { bg: '#FEF2F2', border: 'rgba(215,30,43,0.25)',  color: '#D71E2B', icon: '📊' }
+      if (t.includes('negative'))    return { bg: '#FFF7ED', border: 'rgba(180,83,9,0.25)',   color: '#B45309', icon: '🚫' }
+      if (t.includes('affirmative')) return { bg: '#EAF7F0', border: 'rgba(26,127,75,0.25)',  color: '#1A7F4B', icon: '✅' }
+      if (t.includes('reporting'))   return { bg: '#EFF6FF', border: 'rgba(29,78,216,0.25)',  color: '#1D4ED8', icon: '📋' }
+      if (t.includes('payment'))     return { bg: '#F5F3FF', border: 'rgba(124,58,237,0.25)', color: '#7C3AED', icon: '💳' }
+      if (t.includes('information')) return { bg: '#EFF6FF', border: 'rgba(29,78,216,0.25)',  color: '#1D4ED8', icon: '📁' }
+      return                                { bg: 'var(--surface-2)', border: 'var(--border-2)', color: 'var(--ink-2)', icon: '📌' }
+    }
+
+    // Summary counts by type
+    const typeCounts: Record<string, number> = {}
+    obligations.forEach(ob => {
+      const label = ob.obligation_type.replace(/_/g, ' ')
+      typeCounts[label] = (typeCounts[label] || 0) + 1
+    })
+
     return (
       <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-        {profile.obligations && profile.obligations.length > 0 ? (
-          <Card title="Covenants & Obligations" subtitle={`${profile.obligations.length} found`}>
-            {profile.obligations.map((ob, i) => (
-              <div key={i} style={{ padding: '16px 20px', borderBottom: i < profile.obligations!.length - 1 ? '0.5px solid var(--border-1)' : 'none', background: i % 2 === 0 ? 'var(--surface)' : 'var(--surface-2)' }}>
-                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, marginBottom: ob.trigger_language ? 8 : 0 }}>
-                  <span style={{ fontSize: 11, fontWeight: 500, flexShrink: 0, background: ob.obligation_type === 'financial_covenant' ? 'var(--wf-red-light)' : 'var(--surface-3)', color: ob.obligation_type === 'financial_covenant' ? 'var(--wf-red)' : 'var(--ink-2)', padding: '2px 8px', borderRadius: 4, textTransform: 'capitalize', whiteSpace: 'nowrap' }}>
-                    {ob.obligation_type.replace(/_/g, ' ')}
-                  </span>
-                  <span style={{ fontSize: 13, color: 'var(--ink)', lineHeight: 1.6 }}>{ob.description}</span>
-                </div>
-                {ob.trigger_language && (
-                  <div style={{ fontSize: 12, color: 'var(--warning)', background: '#FEF9EE', padding: '4px 10px', borderRadius: 4, display: 'inline-block', marginLeft: 80 }}>
-                    Trigger: "{ob.trigger_language}"
-                  </div>
-                )}
-              </div>
-            ))}
-          </Card>
-        ) : (
-          <div style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', padding: '40px', textAlign: 'center', color: 'var(--ink-3)', fontSize: 14 }}>
-            No obligations extracted for this document.
+
+        {obligations.length === 0 ? (
+          <div style={{ background: 'var(--surface)', border: '0.5px solid var(--border-1)', borderRadius: 'var(--radius-lg)', padding: '56px 40px', textAlign: 'center' }}>
+            <div style={{ fontSize: 32, marginBottom: 12 }}>📋</div>
+            <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--ink)', marginBottom: 6 }}>No obligations extracted</div>
+            <div style={{ fontSize: 13, color: 'var(--ink-3)' }}>No covenants or obligations were detected in this document.</div>
           </div>
+        ) : (
+          <>
+            {/* Summary strip */}
+            <div style={{
+              display: 'flex', gap: 10, flexWrap: 'wrap',
+              background: 'var(--surface)', border: '0.5px solid var(--border-1)',
+              borderRadius: 'var(--radius-lg)', padding: '14px 18px',
+              alignItems: 'center',
+            }}>
+              <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink-3)', textTransform: 'uppercase', letterSpacing: '0.06em', marginRight: 4 }}>
+                {obligations.length} Total
+              </span>
+              {Object.entries(typeCounts).map(([label, count]) => {
+                const { bg, border, color } = obStyle(label)
+                return (
+                  <span key={label} style={{
+                    fontSize: 11, fontWeight: 600,
+                    padding: '3px 10px', borderRadius: 20,
+                    background: bg, color, border: `0.5px solid ${border}`,
+                  }}>
+                    {count} {label}
+                  </span>
+                )
+              })}
+            </div>
+
+            {/* Obligation cards */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {obligations.map((ob, i) => {
+                const { bg, border, color, icon } = obStyle(ob.obligation_type)
+                return (
+                  <div key={i} style={{
+                    background: 'var(--surface)',
+                    border: '0.5px solid var(--border-1)',
+                    borderLeft: `4px solid ${color}`,
+                    borderRadius: 'var(--radius-lg)',
+                    padding: '16px 20px',
+                    boxShadow: 'var(--shadow-sm)',
+                    display: 'flex', flexDirection: 'column', gap: 10,
+                  }}>
+                    {/* Header */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <span style={{
+                        fontSize: 11, fontWeight: 700,
+                        padding: '3px 10px', borderRadius: 20,
+                        background: bg, color, border: `0.5px solid ${border}`,
+                        textTransform: 'capitalize', whiteSpace: 'nowrap',
+                        display: 'flex', alignItems: 'center', gap: 5,
+                      }}>
+                        <span>{icon}</span>
+                        {ob.obligation_type.replace(/_/g, ' ')}
+                      </span>
+                      {ob.party_responsible && (
+                        <span style={{ fontSize: 11, color: 'var(--ink-3)', fontWeight: 500 }}>
+                          → <span style={{ color: 'var(--ink)', fontWeight: 600 }}>{ob.party_responsible}</span>
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Description */}
+                    <div style={{ fontSize: 13, color: 'var(--ink)', lineHeight: 1.65 }}>
+                      {ob.description}
+                    </div>
+
+                    {/* Trigger language */}
+                    {ob.trigger_language && (
+                      <div style={{
+                        display: 'flex', alignItems: 'flex-start', gap: 8,
+                        background: '#FFFBEB', border: '0.5px solid rgba(180,83,9,0.2)',
+                        borderRadius: 8, padding: '8px 12px',
+                      }}>
+                        <span style={{ fontSize: 11, fontWeight: 700, color: '#B45309', whiteSpace: 'nowrap', marginTop: 1 }}>TRIGGER</span>
+                        <span style={{ fontSize: 12, color: '#92400E', lineHeight: 1.5, fontStyle: 'italic' }}>
+                          "{ob.trigger_language}"
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </>
         )}
       </div>
     )

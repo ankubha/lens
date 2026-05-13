@@ -142,7 +142,9 @@ export default function ProfilePage({ params }: { params: Promise<{ id: string }
                 isStructured && profile.row_count    != null && { label: 'Rows',     value: profile.row_count.toLocaleString() },
                 isStructured && profile.column_count != null && { label: 'Columns',  value: profile.column_count.toString() },
                 isUnstructured && profile.page_count != null && { label: 'Pages',    value: profile.page_count.toString() },
-                isUnstructured && { label: 'Language', value: profile.detected_language?.toUpperCase() || 'EN' },
+                isUnstructured && { label: 'Language',   value: profile.detected_language?.toUpperCase() || 'EN' },
+                isUnstructured && { label: 'Scanned',    value: profile.is_scanned ? 'Yes (OCR)' : 'Native PDF' },
+                isUnstructured && { label: 'Has Tables', value: profile.has_tables ? 'Yes' : 'No' },
                 profile.llm_used && { label: 'Model', value: profile.llm_used },
               ].filter(Boolean).map((item: any) => (
                 <div key={item.label}>
@@ -203,7 +205,6 @@ export default function ProfilePage({ params }: { params: Promise<{ id: string }
             { label: 'Pages',             value: profile.page_count?.toString() || '—',                            sub: 'total pages' },
             { label: 'Fields Extracted',  value: `${profile.found_fields_count || 0}/${profile.expected_fields_count || 0}`, sub: 'critical elements' },
             { label: 'Completeness',      value: `${profile.completeness_score?.toFixed(0) || 0}%`,                sub: 'schema coverage', alert: (profile.completeness_score || 0) < 70 },
-            { label: 'Doc Type Confidence', value: profile.document_type_confidence ? `${(profile.document_type_confidence * 100).toFixed(0)}%` : '—', sub: 'confidence' },
             { label: 'Additional Findings', value: profile.additional_findings?.length.toString() || '0',          sub: 'extra facts' },
           ].map((stat: any) => (
             <div key={stat.label} style={{

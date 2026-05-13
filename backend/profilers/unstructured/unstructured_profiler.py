@@ -116,41 +116,71 @@ def clean_json(text: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# LAYER 1 — DOCUMENT FINGERPRINT (deterministic)
+# LAYER 1 — DOCUMENT FINGERPRINT (LLM-based)
 # ─────────────────────────────────────────────
 
-DOC_TYPE_KEYWORDS = {
-    DocumentType.COMMERCIAL_LOAN: [
-        "loan agreement", "term loan", "credit agreement",
-        "borrower", "lender", "facility", "maturity date",
-    ],
-    DocumentType.TERM_SHEET: [
-        "term sheet", "indicative terms", "non-binding",
-    ],
-    DocumentType.CREDIT_MEMO: [
-        "credit memorandum", "credit memo", "credit approval",
-    ],
-    DocumentType.FINANCIAL_STATEMENT: [
-        "balance sheet", "income statement", "cash flow",
-        "profit and loss", "audited",
-    ],
-    DocumentType.MSA: [
-        "master service agreement", "statement of work",
-    ],
-}
+# All valid unstructured document type values the LLM can pick from
+_UNSTRUCTURED_DOC_TYPES = [
+    dt.value for dt in DocumentType
+    if dt.value not in ("csv", "xlsx", "json", "xml", "unknown")
+]
 
 
 def classify_document(text_sample: str) -> tuple[DocumentType, float]:
-    text_lower = text_sample.lower()
-    scores = {}
-    for doc_type, keywords in DOC_TYPE_KEYWORDS.items():
-        hits = sum(1 for kw in keywords if kw in text_lower)
-        scores[doc_type] = hits / len(keywords)
-    if not scores or max(scores.values()) == 0:
+    """
+    LLM-based document type classification.
+    Reads the document text and returns the best matching DocumentType
+    with a calibrated confidence score.
+    """
+    types_list = ", ".join(_UNSTRUCTURED_DOC_TYPES)
+    prompt = f"""You are a financial document analyst at a major bank.
+Read the opening text of this document and classify it into exactly one document type.
+
+VALID DOCUMENT TYPES (pick exactly one value):
+{types_list}
+
+DOCUMENT TEXT (first 2500 chars):
+{text_sample[:2500]}
+
+Respond ONLY with a JSON object — no markdown, no explanation outside the JSON:
+{{
+  "doc_type": "commercial_loan",
+  "confidence": 0.92,
+  "reasoning": "Contains borrower/lender definitions, facility amount, maturity date, and standard loan covenants."
+}}
+
+Confidence guide:
+- 0.90–0.99: unmistakable — clear title, standard clauses, no ambiguity
+- 0.70–0.89: very likely — strong signals but minor ambiguity
+- 0.50–0.69: probable — some signals present but document is atypical
+- 0.30–0.49: uncertain — weak signals, document may be generic
+- Use "generic_pdf" when nothing fits"""
+
+    try:
+        response = call_llm(prompt)
+        text = re.sub(r"^```json\s*", "", response.strip())
+        text = re.sub(r"^```\s*",      "", text)
+        text = re.sub(r"\s*```$",      "", text).strip()
+        data = json.loads(text)
+
+        dt_str     = data.get("doc_type", "generic_pdf")
+        confidence = float(data.get("confidence", 0.5))
+        reasoning  = data.get("reasoning", "")
+
+        try:
+            doc_type = DocumentType(dt_str)
+        except ValueError:
+            print(f"  [Lens] Unknown doc_type from LLM: {dt_str!r} — falling back to generic_pdf")
+            doc_type = DocumentType.GENERIC_PDF
+            confidence = 0.4
+
+        confidence = round(min(0.99, max(0.1, confidence)), 2)
+        print(f"  [Lens] Doc type: {doc_type.value} ({confidence*100:.0f}%) — {reasoning[:80]}")
+        return doc_type, confidence
+
+    except Exception as e:
+        print(f"  [Lens] LLM classification failed: {e} — falling back to generic_pdf")
         return DocumentType.GENERIC_PDF, 0.4
-    best = max(scores, key=scores.get)
-    confidence = min(0.95, 0.5 + scores[best] * 2)
-    return best, round(confidence, 2)
 
 
 def extract_fingerprint(pdf, path: Path) -> dict:
