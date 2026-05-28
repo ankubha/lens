@@ -618,6 +618,28 @@ def profile_column(series: pd.Series) -> ColumnProfile:
                 for k, v in vc.head(10).items()
             ]
 
+    # ── Numeric coercion fallback for mixed-type (Unsupported) columns ──────────
+    # When pandas can't determine a clean dtype, try forcing numeric. If ≥50% of
+    # non-null values parse successfully, backfill the key stats so that the DQ
+    # engine can compute IQR bounds and detect non-numeric contamination.
+    if base.min is None and var_type in ("Unsupported",):
+        try:
+            coerced = pd.to_numeric(series, errors="coerce")
+            clean_c = coerced.dropna()
+            n_c = len(clean_c)
+            if n_c > 0 and n_c / max(total - missing, 1) >= 0.5:
+                base.min            = round(float(clean_c.min()), 4)
+                base.max            = round(float(clean_c.max()), 4)
+                base.mean           = round(float(clean_c.mean()), 4)
+                base.median         = round(float(clean_c.median()), 4)
+                base.std_dev        = round(float(clean_c.std()), 4)
+                base.percentile_25  = round(float(clean_c.quantile(0.25)), 4)
+                base.percentile_75  = round(float(clean_c.quantile(0.75)), 4)
+                base.negative_count = int((clean_c < 0).sum())
+                base.zeros_count    = int((clean_c == 0).sum())
+        except Exception:
+            pass
+
     # ── Per-column quality scores (0-100) ────────────────────
     n_non_null = total - missing
 

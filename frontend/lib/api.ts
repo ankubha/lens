@@ -218,14 +218,35 @@ export interface ProfileSummary {
 // ── DQ Engine types ───────────────────────────────────────
 
 export type DQCheckType =
-  | 'not_null' | 'min_max_range' | 'iqr_outlier' | 'z_score_outlier'
-  | 'non_negative' | 'categorical_set' | 'string_length' | 'pattern_match'
-  | 'uniqueness' | 'no_future_date' | 'date_range' | 'distribution_fit'
+  // Completeness
+  | 'not_null' | 'any_not_null' | 'required_values'
+  // Validity
+  | 'is_type' | 'matches_pattern' | 'expected_values' | 'expected_schema' | 'field_count'
+  // Numeric
+  | 'between' | 'min_value' | 'max_value' | 'not_negative' | 'positive'
+  | 'greater_than' | 'less_than' | 'distinct_count'
+  // String
+  | 'min_length' | 'max_length'
+  // DateTime
+  | 'not_future' | 'after_date_time' | 'before_date_time' | 'between_times'
+  // Cross-field
+  | 'greater_than_field' | 'less_than_field' | 'equal_to_field'
+  // Aggregate
+  | 'sum'
+  // Dataset-level
+  | 'unique'
+  // Custom (user-only)
+  | 'satisfies_expression'
+  // Legacy (backward compat)
+  | 'min_max_range' | 'iqr_outlier' | 'z_score_outlier' | 'non_negative'
+  | 'categorical_set' | 'string_length' | 'pattern_match' | 'uniqueness'
+  | 'no_future_date' | 'date_range' | 'distribution_fit'
 
 export type DQCheckStatus = 'pending' | 'authorized' | 'rejected'
 
 export type DQDimension =
-  | 'completeness' | 'validity' | 'uniqueness' | 'conformity' | 'accuracy' | 'consistency'
+  | 'completeness' | 'validity' | 'numeric' | 'string'
+  | 'date_time' | 'cross_field' | 'aggregate' | 'dataset_level'
 
 export interface DQCheck {
   check_id: string
@@ -236,14 +257,18 @@ export interface DQCheck {
   parameters: Record<string, any>
   description: string
   dimension: DQDimension
-  confidence: number
-  train_pass_rate: number
-  test_pass_rate: number
-  sample_size: number
+  severity?: 'HIGH' | 'MEDIUM' | 'LOW'
+  rationale?: string
+  source?: 'inferred' | 'user_defined'
   created_at: string
   pass_count?: number
   fail_count?: number
   fail_pct?: number
+  // Legacy fields (optional, populated by old check files)
+  confidence?: number
+  train_pass_rate?: number
+  test_pass_rate?: number
+  sample_size?: number
 }
 
 export interface DQAnomaly {
@@ -319,5 +344,32 @@ export async function getScanResult(profileId: string): Promise<ScanResult | nul
   const res = await fetch(`${API_BASE}/api/profiles/${profileId}/scan-result`)
   if (res.status === 404) return null
   if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Failed to fetch scan result') }
+  return res.json()
+}
+
+export async function uploadDQRules(profileId: string, file: File): Promise<{ added: number; errors: string[]; checks: DQCheck[] }> {
+  const formData = new FormData()
+  formData.append('file', file)
+  const res = await fetch(`${API_BASE}/api/profiles/${profileId}/checks/upload-rules`, {
+    method: 'POST',
+    body: formData,
+  })
+  if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Upload failed') }
+  return res.json()
+}
+
+export async function addManualDQRule(profileId: string, rule: {
+  column_name: string
+  check_type: DQCheckType
+  dimension: DQDimension
+  parameters?: Record<string, any>
+  description?: string
+}): Promise<DQCheck> {
+  const res = await fetch(`${API_BASE}/api/profiles/${profileId}/checks/manual-rule`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rule),
+  })
+  if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'Failed to add rule') }
   return res.json()
 }

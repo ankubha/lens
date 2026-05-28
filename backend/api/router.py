@@ -18,7 +18,7 @@ from backend.profilers.unstructured.unstructured_profiler import profile_unstruc
 from backend.profilers.semi_structured.semi_structured_profiler import profile_semi_structured
 from backend.core.fry14_validator import validate_against_schedule_h
 from backend.agent.lensbot import ask_lensbot
-from backend.dq.models import DQCheck, DQCheckStatus, ScanResult
+from backend.dq.models import DQCheck, DQCheckStatus, DQCheckType, DQDimension, ScanResult
 from backend.dq.inference_engine import infer_checks
 from backend.dq.scanner import run_scan
 from pydantic import BaseModel as PydanticBase
@@ -90,8 +90,6 @@ def _load_all() -> None:
         except Exception:
             pass
 
-_load_all()
-
 # Supported file types
 STRUCTURED_EXTENSIONS   = {".csv", ".xlsx", ".xls"}
 UNSTRUCTURED_EXTENSIONS = {".pdf", ".docx"}
@@ -102,6 +100,8 @@ ALL_SUPPORTED = (
     UNSTRUCTURED_EXTENSIONS |
     SEMI_STRUCTURED_EXTENSIONS
 )
+
+_load_all()
 
 
 def detect_modality(suffix: str) -> str:
@@ -988,6 +988,196 @@ def get_scan_result(profile_id: str):
     if profile_id not in dq_scan_store:
         raise HTTPException(404, "No scan result found. Run a scan first.")
     return dq_scan_store[profile_id].model_dump()
+
+
+class ManualRuleRequest(PydanticBase):
+    column_name: str
+    check_type: DQCheckType
+    dimension: DQDimension
+    parameters: dict = {}
+    description: str = ""
+
+
+_PARAM_ALIASES: dict[str, str] = {
+    "minimum": "min", "maximum": "max", "min_val": "min", "max_val": "max",
+    "type": "expected_type", "dtype": "expected_type",
+    "values": "allowed_values", "valid_values": "allowed_values", "choices": "allowed_values",
+    "regex": "pattern", "regexp": "pattern",
+    "expr": "expression", "formula": "expression", "rule": "expression", "condition": "expression",
+    "column": "field", "compare_to": "field", "other_column": "field", "other": "field",
+    "after_date": "after", "from": "after", "before_date": "before", "to": "before",
+    "min_len": "min_length", "max_len": "max_length",
+    "threshold": "threshold",
+}
+
+_PARAM_DEFAULTS: dict[str, dict] = {
+    "is_type":          {"expected_type": "numeric"},
+    "min_length":       {"min_length": 1},
+    "max_length":       {"max_length": 255},
+    "min_value":        {"min": 0},
+    "max_value":        {"max": 1000},
+    "greater_than":     {"threshold": 0},
+    "less_than":        {"threshold": 1000000},
+    "between":          {"min": 0, "max": 1000},
+    "between_times":    {"after": "2000-01-01"},
+    "distinct_count":   {"min": 1, "max": 100},
+    "field_count":      {"min": 1, "max": 100},
+    "sum":              {"min": 0, "max": 1e12},
+}
+
+
+def _normalize_params(ct: str, params: dict) -> dict:
+    p = {_PARAM_ALIASES.get(k, k): v for k, v in params.items()}
+    for k, v in _PARAM_DEFAULTS.get(ct, {}).items():
+        if k not in p:
+            p[k] = v
+    # Clamp between_times "before" to today if future
+    if ct == "between_times":
+        from datetime import date as _date
+        today = _date.today().isoformat()
+        if "before" not in p:
+            p["before"] = today
+        elif str(p["before"]) > today:
+            p["before"] = today
+    return p
+
+
+def _auto_description(ct: str, col: str, params: dict) -> str:
+    label = col.replace("_", " ").title()
+    descriptions = {
+        "not_null":           f"{label} must not be null",
+        "is_type":            f"{label} must be a valid {params.get('expected_type', 'value')}",
+        "between":            f"{label} must be between {params.get('min')} and {params.get('max')}",
+        "not_negative":       f"{label} must not be negative",
+        "positive":           f"{label} must be positive",
+        "matches_pattern":    f"{label} must match pattern {params.get('pattern', '')}",
+        "expected_values":    f"{label} must be one of the allowed values",
+        "not_future":         f"{label} must not be a future date",
+        "between_times":      f"{label} must fall between {params.get('after', '')} and {params.get('before', '')}",
+        "greater_than_field": f"{label} must be greater than {params.get('field', '')}",
+        "less_than_field":    f"{label} must be less than {params.get('field', '')}",
+        "equal_to_field":     f"{label} must equal {params.get('field', '')}",
+        "satisfies_expression": f"{label} satisfies: {params.get('expression', '')}",
+        "unique":             "No duplicate rows allowed",
+        "field_count":        f"Dataset must have exactly {params.get('min', '?')} columns",
+        "min_length":         f"{label} must be at least {params.get('min_length', '?')} characters",
+        "max_length":         f"{label} must not exceed {params.get('max_length', '?')} characters",
+        "min_value":          f"{label} must be at least {params.get('min', '?')}",
+        "max_value":          f"{label} must not exceed {params.get('max', '?')}",
+        "distinct_count":     f"{label} must have between {params.get('min')} and {params.get('max')} distinct values",
+    }
+    return descriptions.get(ct, f"{label} passes {ct.replace('_', ' ')} check")
+
+
+@router.post("/profiles/{profile_id}/checks/manual-rule")
+def add_manual_dq_rule(profile_id: str, body: ManualRuleRequest):
+    """Add a single user-defined DQ rule. Auto-normalizes parameters and fills in defaults."""
+    if profile_id not in profile_store:
+        raise HTTPException(404, f"Profile '{profile_id}' not found.")
+    if not body.column_name.strip():
+        raise HTTPException(400, "column_name is required.")
+
+    from backend.dq.inference_engine import _sanitize_llm_check, _CHECK_DIMENSION
+
+    col     = body.column_name.strip()
+    ct      = body.check_type.value
+    profile = profile_store[profile_id]
+
+    # Normalize parameter keys and fill in missing defaults
+    params = _normalize_params(ct, body.parameters or {})
+
+    # Apply the same sanitization used for LLM-proposed checks (clamps, drops, overrides)
+    col_profile = next((c for c in profile.columns if c.column_name == col), None)
+    item = _sanitize_llm_check(
+        {"check_type": ct, "column_name": col, "parameters": params, "severity": "HIGH"},
+        col_profile=col_profile,
+    )
+    if item is None:
+        item = {"check_type": ct, "column_name": col, "parameters": params, "severity": "HIGH"}
+
+    # Auto-generate description if user left it blank
+    description = body.description.strip() or _auto_description(ct, col, item.get("parameters", {}))
+
+    # Always use canonical dimension
+    dim = _CHECK_DIMENSION.get(ct, body.dimension)
+
+    check = DQCheck(
+        profile_id  = profile_id,
+        column_name = col,
+        check_type  = body.check_type,
+        dimension   = dim,
+        parameters  = item.get("parameters", {}),
+        description = description,
+        severity    = item.get("severity", "HIGH"),
+        rationale   = "User-defined rule.",
+        source      = "user_defined",
+    )
+    existing = dq_check_store.get(profile_id, [])
+    existing.append(check)
+    dq_check_store[profile_id] = existing
+    _save_checks(profile_id)
+    return check.model_dump()
+
+
+@router.post("/profiles/{profile_id}/checks/upload-rules")
+async def upload_dq_rules(profile_id: str, file: UploadFile = File(...)):
+    """Upload DQ rules from a JSON array or CSV file."""
+    import csv as _csv
+    import io as _io_mod
+
+    if profile_id not in profile_store:
+        raise HTTPException(404, f"Profile '{profile_id}' not found.")
+
+    content = await file.read()
+    fname = (file.filename or "").lower()
+
+    try:
+        if fname.endswith(".json"):
+            raw_rules = json.loads(content)
+            if not isinstance(raw_rules, list):
+                raise ValueError("JSON must be an array of rule objects.")
+        elif fname.endswith(".csv"):
+            text = content.decode("utf-8", errors="replace")
+            reader = _csv.DictReader(_io_mod.StringIO(text))
+            raw_rules = []
+            for row in reader:
+                r = {k.strip(): (v or "").strip() for k, v in row.items() if k}
+                if r.get("parameters"):
+                    try:
+                        r["parameters"] = json.loads(r["parameters"])
+                    except Exception:
+                        r["parameters"] = {}
+                else:
+                    r["parameters"] = {}
+                raw_rules.append(r)
+        else:
+            raise HTTPException(400, "Only .json and .csv files are supported.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"File parse error: {str(e)}")
+
+    new_checks: list[DQCheck] = []
+    errors: list[str] = []
+    for i, rule in enumerate(raw_rules):
+        try:
+            check = DQCheck(
+                profile_id=profile_id,
+                column_name=str(rule.get("column_name", "")).strip(),
+                check_type=DQCheckType(rule.get("check_type", "")),
+                dimension=DQDimension(rule.get("dimension", "")),
+                parameters=rule.get("parameters") or {},
+                description=str(rule.get("description", "")),
+                source="user_defined",
+            )
+            new_checks.append(check)
+        except Exception as e:
+            errors.append(f"Rule {i + 1}: {str(e)}")
+
+    existing = dq_check_store.get(profile_id, [])
+    dq_check_store[profile_id] = existing + new_checks
+    _save_checks(profile_id)
+    return {"added": len(new_checks), "errors": errors, "checks": [c.model_dump() for c in new_checks]}
 
 
 # ── DataForge ─────────────────────────────────────────────
